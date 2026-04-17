@@ -1,0 +1,148 @@
+{
+  "enabled": {
+    "description": "是否启用聊天记录采集与导出",
+    "type": "bool",
+    "default": true
+  },
+  "listening_group_ids": {
+    "description": "监听群号列表（默认空，即不监听任何群）",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "data_dir": {
+    "description": "插件数据目录（默认 /AstrBot/data/plugin_data/astrbot_plugin_chat_export）",
+    "type": "string",
+    "default": ""
+  },
+  "db_path": {
+    "description": "SQLite 数据库文件路径（相对 data_dir 或绝对路径）",
+    "type": "string",
+    "default": "chat_export.db"
+  },
+  "export_dir": {
+    "description": "导出 TXT 的目录（相对 data_dir 或绝对路径）",
+    "type": "string",
+    "default": "exports"
+  },
+  "admin_user_ids": {
+    "description": "允许执行导出/检索命令的用户 ID 列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "allow_astrbot_admin": {
+    "description": "是否允许 AstrBot 管理员执行导出/检索命令",
+    "type": "bool",
+    "default": true
+  },
+  "verbose_log": {
+    "description": "是否输出详细采集日志（排查入库问题建议开启）",
+    "type": "bool",
+    "default": true
+  },
+  "log_every_n": {
+    "description": "每写入 N 条 SQLite 记录输出一次 ingest 日志",
+    "type": "int",
+    "default": 1
+  },
+  "log_preview_len": {
+    "description": "ingest 日志里的消息预览长度",
+    "type": "int",
+    "default": 24
+  },
+  "search_default_since_hours": {
+    "description": "聊天检索默认回溯小时数（0 表示不限）",
+    "type": "int",
+    "default": 24
+  },
+  "stop_event_after_ingest": {
+    "description": "采集后终止事件传播（实现只记录不回复）",
+    "type": "bool",
+    "default": false
+  },
+  "index_media_placeholders": {
+    "description": "是否将纯图片/表情占位文本也写入向量库",
+    "type": "bool",
+    "default": false
+  },
+  "qdrant_enabled": {
+    "description": "是否启用 Qdrant 向量存储",
+    "type": "bool",
+    "default": false
+  },
+  "qdrant_url": {
+    "description": "Qdrant 地址",
+    "type": "string",
+    "default": "http://127.0.0.1:6333"
+  },
+  "qdrant_api_key": {
+    "description": "Qdrant API Key（如无可留空）",
+    "type": "string",
+    "default": ""
+  },
+  "qdrant_collection": {
+    "description": "Qdrant 集合名",
+    "type": "string",
+    "default": "chat_export"
+  },
+  "qdrant_distance": {
+    "description": "向量距离（Cosine / Dot / Euclid）",
+    "type": "string",
+    "default": "Cosine"
+  },
+  "qdrant_timeout": {
+    "description": "Qdrant 请求超时（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "qdrant_batch_size": {
+    "description": "Qdrant 批量写入条数阈值",
+    "type": "int",
+    "default": 20
+  },
+  "qdrant_flush_interval_sec": {
+    "description": "Qdrant 队列刷新间隔（秒）",
+    "type": "float",
+    "default": 1.0
+  },
+  "embedding_api_base": {
+    "description": "Embedding 接口 Base URL（OpenAI 兼容）",
+    "type": "string",
+    "default": "https://api.openai.com/v1"
+  },
+  "embedding_api_key": {
+    "description": "Embedding 接口 Key",
+    "type": "string",
+    "default": ""
+  },
+  "embedding_model": {
+    "description": "Embedding 模型名",
+    "type": "string",
+    "default": "text-embedding-3-small"
+  },
+  "embedding_dimension": {
+    "description": "向量维度（需与模型输出一致）",
+    "type": "int",
+    "default": 1536
+  },
+  "embedding_timeout": {
+    "description": "Embedding 请求超时（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "search_top_k": {
+    "description": "语义检索返回条数",
+    "type": "int",
+    "default": 5
+  },
+  "sqlite_wal": {
+    "description": "是否启用 SQLite WAL 模式",
+    "type": "bool",
+    "default": true
+  }
+}
