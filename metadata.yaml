@@ -1,0 +1,7 @@
+name: astrbot_plugin_chat_export
+author: NOTFROMCONCEN
+desc: 按群监听聊天并导出 TXT，支持 Qdrant 语义检索
+version: 0.4.0
+repo: https://example.com/astrbot_plugin_chat_export
+display_name: 聊天导出
+astrbot_version: ">=4.16,<5"
