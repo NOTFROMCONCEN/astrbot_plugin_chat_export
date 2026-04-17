@@ -20,7 +20,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "0.4.0",
+    "1.3.5",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
