@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import json
@@ -20,7 +20,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "1.3.6",
+    "1.3.7",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -53,6 +53,8 @@ class ChatExportPlugin(Star):
         self._last_sqlite_ok_ts = ""
         self._last_qdrant_ok_ts = ""
         self._last_error = ""
+        self._sqlite_pending: list[dict[str, Any]] = []
+        self._last_sqlite_flush_ts = time.time()
         self._qdrant_pending: list[dict[str, Any]] = []
         self._last_qdrant_flush_ts = time.time()
         self._init_qdrant_if_needed()
@@ -90,18 +92,9 @@ class ChatExportPlugin(Star):
             "unique_key": unique_key,
         }
 
-        sqlite_state = self._insert_message(record)
-        if sqlite_state == "inserted":
-            self._sqlite_write_ok += 1
-            self._last_sqlite_ok_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elif sqlite_state == "duplicate":
-            self._sqlite_dedup_skip += 1
-        else:
-            self._sqlite_write_fail += 1
-
-        if sqlite_state == "inserted" and self._qdrant_enabled() and self._should_index_to_qdrant(content):
-            self._qdrant_pending.append(record)
-            self._flush_qdrant_queue_if_needed()
+        self._sqlite_pending.append(record)
+        self._flush_sqlite_queue_if_needed()
+        self._flush_qdrant_queue_if_needed()
 
         self._log_ingest_progress(group_id, user_id, content)
 
@@ -165,7 +158,7 @@ class ChatExportPlugin(Star):
             yield event.plain_result("无权限执行导出")
             return
 
-        self._flush_qdrant_queue(force=True)
+        self._flush_all_queues(force=True)
 
         tokens = [t for t in (event.message_str or "").strip().split() if t]
         if len(tokens) < 3:
@@ -222,7 +215,7 @@ class ChatExportPlugin(Star):
             yield event.plain_result("Qdrant 初始化失败，请检查 qdrant_url / qdrant_api_key / qdrant_client 依赖")
             return
 
-        self._flush_qdrant_queue(force=True)
+        self._flush_all_queues(force=True)
 
         tokens = [t for t in (event.message_str or "").strip().split() if t]
         if len(tokens) < 2:
@@ -312,7 +305,7 @@ class ChatExportPlugin(Star):
             yield event.plain_result("无权限执行统计")
             return
 
-        self._flush_qdrant_queue(force=True)
+        self._flush_all_queues(force=True)
 
         tokens = [t for t in (event.message_str or "").strip().split() if t]
         group_id = self._norm(tokens[1]) if len(tokens) >= 2 else self._norm(event.get_group_id())
@@ -341,6 +334,7 @@ class ChatExportPlugin(Star):
             f"- runtime_received_group_events: {self._received_group_events}",
             f"- runtime_sqlite_ok/fail/dedup: {self._sqlite_write_ok}/{self._sqlite_write_fail}/{self._sqlite_dedup_skip}",
             f"- runtime_qdrant_ok/fail: {self._qdrant_write_ok}/{self._qdrant_write_fail}",
+            f"- queue_sqlite: {len(self._sqlite_pending)}",
             f"- queue_qdrant: {len(self._qdrant_pending)}",
         ]
 
@@ -364,7 +358,7 @@ class ChatExportPlugin(Star):
             yield event.plain_result("无权限执行健康检查")
             return
 
-        self._flush_qdrant_queue(force=True)
+        self._flush_all_queues(force=True)
         mins = max((datetime.now() - self._startup_time).total_seconds() / 60.0, 1e-6)
         eps = self._received_group_events / mins
         lines = [
@@ -372,11 +366,14 @@ class ChatExportPlugin(Star):
             f"- uptime_minutes: {mins:.2f}",
             f"- events_per_min: {eps:.2f}",
             f"- sqlite_conn_ready: {self._sqlite_conn is not None}",
+            f"- sqlite_batch_size: {self._int_conf('sqlite_batch_size', 20)}",
+            f"- sqlite_flush_interval_sec: {self._float_conf('sqlite_flush_interval_sec', 1.0)}",
             f"- last_sqlite_ok: {self._last_sqlite_ok_ts or 'none'}",
             f"- last_qdrant_ok: {self._last_qdrant_ok_ts or 'none'}",
             f"- last_error: {self._last_error or 'none'}",
             f"- stop_event_after_ingest: {self._stop_event_after_ingest()}",
             f"- index_media_placeholders: {self._index_media_placeholders()}",
+            f"- sqlite_pending: {len(self._sqlite_pending)}",
             f"- qdrant_pending: {len(self._qdrant_pending)}",
         ]
         yield event.plain_result("\n".join(lines))
@@ -425,35 +422,95 @@ class ChatExportPlugin(Star):
             self._sqlite_conn = conn
         return self._sqlite_conn
 
-    def _insert_message(self, record: dict[str, Any]) -> str:
+    def _flush_all_queues(self, force: bool):
+        inserted = self._flush_sqlite_queue(force=force)
+        if inserted:
+            self._enqueue_qdrant_records(inserted)
+        if force:
+            self._flush_qdrant_queue(force=True)
+
+    def _enqueue_qdrant_records(self, records: list[dict[str, Any]]):
+        if not records or not self._qdrant_enabled():
+            return
+        for rec in records:
+            if self._should_index_to_qdrant(self._norm(rec.get("content"))):
+                self._qdrant_pending.append(rec)
+
+    def _flush_sqlite_queue_if_needed(self):
+        if not self._sqlite_pending:
+            return
+        batch_size = max(1, self._int_conf("sqlite_batch_size", 20))
+        interval = max(0.2, self._float_conf("sqlite_flush_interval_sec", 1.0))
+        now = time.time()
+        if len(self._sqlite_pending) < batch_size and (now - self._last_sqlite_flush_ts) < interval:
+            return
+        inserted = self._flush_sqlite_queue(force=False)
+        if inserted:
+            self._enqueue_qdrant_records(inserted)
+
+    def _flush_sqlite_queue(self, force: bool) -> list[dict[str, Any]]:
+        if not self._sqlite_pending:
+            return []
+
+        batch_size = max(1, self._int_conf("sqlite_batch_size", 20))
+        take = len(self._sqlite_pending) if force else min(len(self._sqlite_pending), batch_size)
+        batch = self._sqlite_pending[:take]
+        del self._sqlite_pending[:take]
+
         sql = (
             "INSERT OR IGNORE INTO chat_messages(ts, group_id, user_id, sender_name, content, message_id, unique_key) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
-        args = (
-            record["ts"],
-            record["group_id"],
-            record["user_id"],
-            record["sender_name"],
-            record["content"],
-            record["message_id"],
-            record["unique_key"],
-        )
+        inserted: list[dict[str, Any]] = []
+        duplicate_count = 0
+
         for retry in range(2):
+            conn = None
             try:
                 conn = self._get_db_conn(reset=(retry == 1))
-                cur = conn.execute(sql, args)
+                conn.execute("BEGIN")
+                for rec in batch:
+                    cur = conn.execute(
+                        sql,
+                        (
+                            rec["ts"],
+                            rec["group_id"],
+                            rec["user_id"],
+                            rec["sender_name"],
+                            rec["content"],
+                            rec["message_id"],
+                            rec["unique_key"],
+                        ),
+                    )
+                    if cur.rowcount and cur.rowcount > 0:
+                        inserted.append(rec)
+                    else:
+                        duplicate_count += 1
                 conn.commit()
-                if cur.rowcount and cur.rowcount > 0:
-                    return "inserted"
-                return "duplicate"
+                break
             except Exception as e:
-                self._last_error = f"sqlite_insert: {e}"
+                self._last_error = f"sqlite_insert_batch: {e}"
+                try:
+                    if conn is not None:
+                        conn.rollback()
+                except Exception:
+                    pass
+                inserted = []
+                duplicate_count = 0
                 if retry == 0:
                     continue
-                logger.error(f"[chat_export] sqlite insert 失败: {e}")
-                return "error"
-        return "error"
+                self._sqlite_write_fail += len(batch)
+                logger.error(f"[chat_export] sqlite 批量写入失败: {e}")
+                self._sqlite_pending = batch + self._sqlite_pending
+                self._last_sqlite_flush_ts = time.time()
+                return []
+
+        self._sqlite_write_ok += len(inserted)
+        self._sqlite_dedup_skip += duplicate_count
+        if inserted:
+            self._last_sqlite_ok_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._last_sqlite_flush_ts = time.time()
+        return inserted
 
     def _query_messages(self, start_dt: datetime, end_dt: datetime, group_id: str):
         sql = "SELECT ts, group_id, user_id, sender_name, content FROM chat_messages WHERE ts >= ? AND ts <= ?"
@@ -1192,7 +1249,7 @@ class ChatExportPlugin(Star):
         return str(v).strip()
 
     async def terminate(self):
-        self._flush_qdrant_queue(force=True)
+        self._flush_all_queues(force=True)
         if self._sqlite_conn is not None:
             try:
                 self._sqlite_conn.close()
@@ -1200,3 +1257,5 @@ class ChatExportPlugin(Star):
                 pass
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
+
+

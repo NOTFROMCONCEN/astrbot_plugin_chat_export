@@ -144,5 +144,15 @@
     "description": "是否启用 SQLite WAL 模式",
     "type": "bool",
     "default": true
+  },
+  "sqlite_batch_size": {
+    "description": "SQLite 批量写入条数阈值",
+    "type": "int",
+    "default": 20
+  },
+  "sqlite_flush_interval_sec": {
+    "description": "SQLite 队列刷新间隔（秒）",
+    "type": "float",
+    "default": 1.0
   }
 }
