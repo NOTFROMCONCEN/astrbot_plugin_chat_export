@@ -234,12 +234,15 @@ class ChatExportPlugin(Star):
             return
 
         limit = self._int_conf("search_top_k", 5)
-        points = self._search_qdrant(vector, group_id, limit, since_dt)
+        fetch_k = max(limit, self._int_conf("search_fetch_k", 60))
+        candidates = self._search_qdrant(vector, group_id, fetch_k, since_dt)
+        points = self._post_filter_search_points(candidates, group_id, since_dt, query_text, limit)
         if not points:
             yield event.plain_result("未检索到相关聊天记录")
             return
 
-        lines = [f"检索结果（Top {len(points)}）:"]
+        since_text = since_dt.strftime("%Y-%m-%d %H:%M:%S") if since_dt else "不限"
+        lines = [f"检索结果（Top {len(points)}，时间下限: {since_text}）:"]
         for idx, p in enumerate(points, start=1):
             payload = self._point_payload(p)
             ts = self._norm(payload.get("ts"))
@@ -714,7 +717,8 @@ class ChatExportPlugin(Star):
         collection = self._norm(self.config.get("qdrant_collection", "chat_export"))
         q_filter = self._build_qdrant_filter(group_id, since_dt)
 
-        top_k = max(1, min(limit, 20))
+        # 先拉取更大的候选集，后续在插件层做硬过滤与重排
+        top_k = max(1, min(limit, 100))
 
         # 兼容 qdrant-client 新旧 API：
         # - 旧版: client.search(...)
@@ -1072,6 +1076,61 @@ class ChatExportPlugin(Star):
         p = getattr(point, "payload", None)
         return p if isinstance(p, dict) else {}
 
+    def _post_filter_search_points(
+        self,
+        points: list[Any],
+        group_id: str,
+        since_dt: datetime | None,
+        query_text: str,
+        limit: int,
+    ) -> list[Any]:
+        if not points:
+            return []
+
+        strict_group = bool(self.config.get("search_hard_group_filter", True))
+        strict_time = bool(self.config.get("search_hard_time_filter", True))
+        keyword_mode = self._norm(self.config.get("search_keyword_mode", "auto")).lower()
+        query = (query_text or "").strip().lower()
+
+        filtered: list[Any] = []
+        for p in points:
+            payload = self._point_payload(p)
+            if not payload:
+                continue
+
+            if strict_group and group_id and self._norm(payload.get("group_id")) != group_id:
+                continue
+
+            if strict_time and since_dt:
+                ts = self._parse_dt(self._norm(payload.get("ts")))
+                if not ts or ts < since_dt:
+                    continue
+
+            filtered.append(p)
+
+        if not filtered:
+            return []
+
+        # 提升“包含关键词”的结果，减少纯语义误召回。
+        if query and keyword_mode != "off":
+            scored: list[tuple[int, Any]] = []
+            for p in filtered:
+                payload = self._point_payload(p)
+                text = self._norm(payload.get("content")).lower()
+                hit = 1 if (query and query in text) else 0
+                scored.append((hit, p))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            filtered = [x[1] for x in scored]
+
+            # auto 模式：query 很短时，只保留包含关键词的结果，避免偏题
+            if keyword_mode == "auto" and query and len(query) <= 8:
+                hard_hits = [p for p in filtered if query in self._norm(self._point_payload(p).get("content")).lower()]
+                if hard_hits:
+                    filtered = hard_hits
+
+        return filtered[: max(1, limit)]
+
     def _index_media_placeholders(self) -> bool:
         return bool(self.config.get("index_media_placeholders", False))
 
@@ -1257,6 +1316,7 @@ class ChatExportPlugin(Star):
                 pass
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
+
 
 
 
