@@ -140,6 +140,26 @@
     "type": "int",
     "default": 5
   },
+  "search_fetch_k": {
+    "description": "语义检索候选拉取条数（先召回再二次过滤）",
+    "type": "int",
+    "default": 60
+  },
+  "search_hard_group_filter": {
+    "description": "检索结果是否强制只保留指定群号",
+    "type": "bool",
+    "default": true
+  },
+  "search_hard_time_filter": {
+    "description": "检索结果是否强制只保留时间窗口内消息",
+    "type": "bool",
+    "default": true
+  },
+  "search_keyword_mode": {
+    "description": "关键词策略：auto(短词强约束)/contains(仅提升命中)/off(仅向量)",
+    "type": "string",
+    "default": "auto"
+  },
   "sqlite_wal": {
     "description": "是否启用 SQLite WAL 模式",
     "type": "bool",
