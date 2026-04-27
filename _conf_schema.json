@@ -27,6 +27,21 @@
     "type": "string",
     "default": "exports"
   },
+  "history_sync_default_limit": {
+    "description": "聊天历史同步默认拉取条数",
+    "type": "int",
+    "default": 100
+  },
+  "history_sync_max_limit": {
+    "description": "聊天历史同步单次最大拉取条数",
+    "type": "int",
+    "default": 1000
+  },
+  "history_sync_page_size": {
+    "description": "聊天历史同步分页大小（按协议端历史 API 分页请求）",
+    "type": "int",
+    "default": 20
+  },
   "admin_user_ids": {
     "description": "允许执行导出/检索命令的用户 ID 列表",
     "type": "list",
@@ -69,6 +84,31 @@
     "description": "是否将纯图片/表情占位文本也写入向量库",
     "type": "bool",
     "default": false
+  },
+  "lsky_enabled": {
+    "description": "是否启用图片自动上传到 Lsky Pro",
+    "type": "bool",
+    "default": false
+  },
+  "lsky_api_base": {
+    "description": "Lsky 地址，例如 http://127.0.0.1:7791",
+    "type": "string",
+    "default": ""
+  },
+  "lsky_token": {
+    "description": "Lsky API Token（Bearer）",
+    "type": "string",
+    "default": ""
+  },
+  "lsky_album_id": {
+    "description": "Lsky 相册 ID（数字 ID，留空则不指定相册）",
+    "type": "string",
+    "default": ""
+  },
+  "lsky_timeout": {
+    "description": "Lsky 下载与上传超时（秒）",
+    "type": "int",
+    "default": 20
   },
   "qdrant_enabled": {
     "description": "是否启用 Qdrant 向量存储",
