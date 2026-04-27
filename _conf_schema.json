@@ -42,6 +42,11 @@
     "type": "int",
     "default": 20
   },
+  "history_sync_action_timeout_sec": {
+    "description": "聊天历史同步单次 OneBot 历史 API 请求超时（秒）",
+    "type": "float",
+    "default": 8.0
+  },
   "admin_user_ids": {
     "description": "允许执行导出/检索命令的用户 ID 列表",
     "type": "list",
