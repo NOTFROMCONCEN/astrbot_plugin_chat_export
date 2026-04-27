@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import mimetypes
@@ -65,6 +66,7 @@ class ChatExportPlugin(Star):
         self._last_sqlite_flush_ts = time.time()
         self._qdrant_pending: list[dict[str, Any]] = []
         self._last_qdrant_flush_ts = time.time()
+        self._history_action_hints: dict[str, tuple[str, tuple[str, ...]]] = {}
         self._init_qdrant_if_needed()
         self._log_startup_summary()
 
@@ -458,6 +460,9 @@ class ChatExportPlugin(Star):
             return
 
         self._flush_all_queues(force=True)
+        yield event.plain_result(
+            f"开始同步群 {group_id} 的历史消息，目标 {self._clamp_history_limit(limit)} 条，请稍候..."
+        )
 
         try:
             stats = await self._sync_group_history(event, group_id, limit)
@@ -499,14 +504,15 @@ class ChatExportPlugin(Star):
         pages = 0
         fetched = 0
         invalid = 0
-        cursor: int | None = None
+        cursor: dict[str, Any] | None = None
         seen_keys: set[str] = set()
         records: list[dict[str, Any]] = []
+        anchor_message_id = self._resolve_history_anchor_message_id(event, group_id)
 
         while len(records) < limit:
             batch_size = min(page_size, limit - len(records))
-            response = await self._fetch_group_history_page(
-                bot, group_id, batch_size, cursor
+            response, action_name = await self._fetch_group_history_page(
+                bot, group_id, batch_size, cursor, anchor_message_id
             )
             items = self._extract_history_items(response)
             if not items:
@@ -514,13 +520,11 @@ class ChatExportPlugin(Star):
 
             pages += 1
             fetched += len(items)
-            oldest_seq: int | None = None
+            self._log_verbose(
+                f"history_sync page={pages} action={action_name} items={len(items)} cursor={cursor or {}}"
+            )
 
             for item in items:
-                seq = self._extract_history_seq(item)
-                if seq is not None:
-                    oldest_seq = seq if oldest_seq is None else min(oldest_seq, seq)
-
                 record = self._normalize_history_message(group_id, item)
                 if record is None:
                     invalid += 1
@@ -532,7 +536,7 @@ class ChatExportPlugin(Star):
                 if len(records) >= limit:
                     break
 
-            next_cursor = self._next_history_cursor(oldest_seq, cursor)
+            next_cursor = self._next_history_cursor(items, cursor)
             if next_cursor is None:
                 break
             cursor = next_cursor
@@ -573,11 +577,13 @@ class ChatExportPlugin(Star):
         bot: Any,
         group_id: str,
         limit: int,
-        cursor: int | None,
-    ) -> Any:
+        cursor: dict[str, Any] | None,
+        anchor_message_id: str,
+    ) -> tuple[Any, str]:
         errors: list[str] = []
+        bucket = self._history_strategy_bucket(cursor)
         for action, params in self._build_history_call_candidates(
-            group_id, limit, cursor
+            group_id, limit, cursor, anchor_message_id
         ):
             try:
                 response = await self._call_onebot_action(bot, action, **params)
@@ -590,7 +596,8 @@ class ChatExportPlugin(Star):
                 errors.append(f"{action}: {err}")
                 continue
 
-            return response
+            self._remember_history_action_hint(bucket, action, params)
+            return response, action
 
         err_text = (
             "; ".join(err for err in errors[-4:] if err) or "协议端不支持群历史消息 API"
@@ -599,13 +606,18 @@ class ChatExportPlugin(Star):
 
     async def _call_onebot_action(self, bot: Any, action: str, **params) -> Any:
         errors: list[str] = []
+        timeout_sec = max(1.0, self._float_conf("history_sync_action_timeout_sec", 8.0))
 
         call_action = getattr(bot, "call_action", None)
         if callable(call_action):
             try:
-                return await call_action(action=action, **params)
+                awaitable = call_action(action=action, **params)
             except TypeError:
-                return await call_action(action, **params)
+                awaitable = call_action(action, **params)
+            try:
+                return await asyncio.wait_for(awaitable, timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                errors.append(f"timeout>{timeout_sec:.0f}s")
             except Exception as e:
                 errors.append(self._norm(e))
 
@@ -613,7 +625,11 @@ class ChatExportPlugin(Star):
         api_call_action = getattr(api, "call_action", None)
         if callable(api_call_action):
             try:
-                return await api_call_action(action, **params)
+                return await asyncio.wait_for(
+                    api_call_action(action, **params), timeout=timeout_sec
+                )
+            except asyncio.TimeoutError:
+                errors.append(f"api_timeout>{timeout_sec:.0f}s")
             except Exception as e:
                 errors.append(self._norm(e))
 
@@ -626,28 +642,92 @@ class ChatExportPlugin(Star):
         self,
         group_id: str,
         limit: int,
-        cursor: int | None,
+        cursor: dict[str, Any] | None,
+        anchor_message_id: str,
     ) -> list[tuple[str, dict[str, Any]]]:
         group_value: Any = int(group_id) if group_id.isdigit() else group_id
+        count = max(1, limit)
+        initial_message_id = anchor_message_id or "0"
         if cursor is None:
             param_candidates = [
-                {"group_id": group_value, "count": limit},
-                {"group_id": group_value, "limit": limit},
-                {"group_id": group_value},
+                {
+                    "group_id": group_value,
+                    "message_seq": 0,
+                    "count": count,
+                    "reverseOrder": False,
+                },
+                {
+                    "group_id": group_value,
+                    "message_seq": 0,
+                    "count": count,
+                    "reverse_order": False,
+                },
+                {
+                    "group_id": group_value,
+                    "message_seq": 0,
+                    "count": count,
+                    "reverse_order": False,
+                    "disable_get_url": False,
+                    "parse_mult_msg": True,
+                    "quick_reply": False,
+                },
+                {"group_id": group_value, "message_seq": 0, "count": count},
+                {
+                    "group_id": group_value,
+                    "message_id": initial_message_id,
+                    "count": count,
+                },
+                {"group_id": group_value, "message_id": 0, "count": count},
+                {"group_id": group_value, "count": count},
             ]
         else:
-            param_candidates = [
-                {"group_id": group_value, "message_seq": cursor, "count": limit},
-                {"group_id": group_value, "message_seq": cursor, "limit": limit},
-                {"group_id": group_value, "message_seq": cursor},
-                {"group_id": group_value, "seq": cursor, "count": limit},
-                {"group_id": group_value, "seq": cursor, "limit": limit},
-                {"group_id": group_value, "seq": cursor},
-                {"group_id": group_value, "last_seq": cursor, "count": limit},
-                {"group_id": group_value, "last_seq": cursor},
-                {"group_id": group_value, "start_seq": cursor, "count": limit},
-                {"group_id": group_value, "start_seq": cursor},
-            ]
+            message_seq = cursor.get("message_seq")
+            message_id = self._norm(cursor.get("message_id"))
+            param_candidates = []
+            if message_seq is not None:
+                param_candidates.extend(
+                    [
+                        {
+                            "group_id": group_value,
+                            "message_seq": message_seq,
+                            "count": count,
+                            "reverseOrder": False,
+                        },
+                        {
+                            "group_id": group_value,
+                            "message_seq": message_seq,
+                            "count": count,
+                            "reverse_order": False,
+                        },
+                        {
+                            "group_id": group_value,
+                            "message_seq": message_seq,
+                            "count": count,
+                        },
+                        {"group_id": group_value, "seq": message_seq, "count": count},
+                        {
+                            "group_id": group_value,
+                            "last_seq": message_seq,
+                            "count": count,
+                        },
+                        {
+                            "group_id": group_value,
+                            "start_seq": message_seq,
+                            "count": count,
+                        },
+                    ]
+                )
+            if message_id:
+                param_candidates.extend(
+                    [
+                        {
+                            "group_id": group_value,
+                            "message_id": message_id,
+                            "count": count,
+                        },
+                        {"group_id": group_value, "message_id": message_id},
+                    ]
+                )
 
         candidates: list[tuple[str, dict[str, Any]]] = []
         seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
@@ -661,7 +741,52 @@ class ChatExportPlugin(Star):
                     continue
                 seen.add(key)
                 candidates.append((action, params))
-        return candidates
+
+        preferred = self._history_action_hints.get(
+            self._history_strategy_bucket(cursor)
+        )
+        if preferred is None:
+            return candidates
+
+        preferred_candidates: list[tuple[str, dict[str, Any]]] = []
+        other_candidates: list[tuple[str, dict[str, Any]]] = []
+        for action, params in candidates:
+            if self._history_action_signature(action, params) == preferred:
+                preferred_candidates.append((action, params))
+            else:
+                other_candidates.append((action, params))
+        return preferred_candidates + other_candidates
+
+    def _history_strategy_bucket(self, cursor: dict[str, Any] | None) -> str:
+        if not cursor:
+            return "initial"
+
+        has_seq = cursor.get("message_seq") is not None
+        has_message_id = bool(self._norm(cursor.get("message_id")))
+        if has_seq and has_message_id:
+            return "cursor_seq_message_id"
+        if has_seq:
+            return "cursor_seq"
+        if has_message_id:
+            return "cursor_message_id"
+        return "cursor"
+
+    @staticmethod
+    def _history_action_signature(
+        action: str, params: dict[str, Any]
+    ) -> tuple[str, tuple[str, ...]]:
+        return action, tuple(sorted(params.keys()))
+
+    def _remember_history_action_hint(
+        self, bucket: str, action: str, params: dict[str, Any]
+    ):
+        signature = self._history_action_signature(action, params)
+        if self._history_action_hints.get(bucket) == signature:
+            return
+        self._history_action_hints[bucket] = signature
+        self._log_verbose(
+            f"history_sync strategy bucket={bucket} action={action} keys={sorted(params.keys())}"
+        )
 
     def _extract_history_items(self, response: Any) -> list[dict[str, Any]]:
         if isinstance(response, list):
@@ -817,18 +942,55 @@ class ChatExportPlugin(Star):
                 return int(text)
         return None
 
-    @staticmethod
+    def _extract_history_message_id(self, item: dict[str, Any]) -> str:
+        message_id = self._extract_message_id_from_obj(item)
+        if message_id:
+            return message_id
+        return self._norm(item.get("message_id"))
+
     def _next_history_cursor(
-        oldest_seq: int | None, prev_cursor: int | None
-    ) -> int | None:
-        if oldest_seq is None:
+        self, items: list[dict[str, Any]], prev_cursor: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if not items:
             return None
-        next_cursor = oldest_seq - 1 if oldest_seq > 0 else oldest_seq
-        if prev_cursor is not None and next_cursor >= prev_cursor:
-            next_cursor = oldest_seq
-        if prev_cursor == next_cursor:
-            return None
-        return next_cursor
+
+        oldest_seq: int | None = None
+        last_message_id = ""
+        oldest_message_id = ""
+        for item in items:
+            message_id = self._extract_history_message_id(item)
+            if message_id:
+                last_message_id = message_id
+
+            seq = self._extract_history_seq(item)
+            if seq is not None and (oldest_seq is None or seq < oldest_seq):
+                oldest_seq = seq
+                oldest_message_id = message_id
+
+        next_cursor: dict[str, Any] = {}
+        if oldest_seq is not None:
+            next_seq = oldest_seq - 1 if oldest_seq > 0 else oldest_seq
+            prev_seq = None if prev_cursor is None else prev_cursor.get("message_seq")
+            if prev_seq != next_seq:
+                next_cursor["message_seq"] = next_seq
+
+        message_id_cursor = oldest_message_id or last_message_id
+        prev_message_id = (
+            "" if prev_cursor is None else self._norm(prev_cursor.get("message_id"))
+        )
+        if message_id_cursor and prev_message_id != message_id_cursor:
+            next_cursor["message_id"] = message_id_cursor
+
+        return next_cursor or None
+
+    def _resolve_history_anchor_message_id(
+        self, event: AstrMessageEvent, group_id: str
+    ) -> str:
+        if self._norm(event.get_group_id()) == group_id:
+            message_id = self._extract_message_id(event)
+            if message_id:
+                return message_id
+        return self._latest_group_message_id(group_id)
 
     def _is_onebot_action_failed(self, response: Any) -> bool:
         if not isinstance(response, dict):
@@ -1043,6 +1205,28 @@ class ChatExportPlugin(Star):
                 logger.error(f"[chat_export] sqlite count 失败: {e}")
                 return 0
         return 0
+
+    def _latest_group_message_id(self, group_id: str) -> str:
+        if not group_id:
+            return ""
+
+        sql = (
+            "SELECT message_id FROM chat_messages "
+            "WHERE group_id = ? AND message_id IS NOT NULL AND message_id != '' "
+            "ORDER BY ts DESC, id DESC LIMIT 1"
+        )
+        for retry in range(2):
+            try:
+                conn = self._get_db_conn(reset=(retry == 1))
+                row = conn.execute(sql, (group_id,)).fetchone()
+                return self._norm(row[0]) if row and row[0] is not None else ""
+            except Exception as e:
+                self._last_error = f"sqlite_latest_message_id: {e}"
+                if retry == 0:
+                    continue
+                logger.error(f"[chat_export] sqlite latest message_id 查询失败: {e}")
+                return ""
+        return ""
 
     def _init_qdrant_if_needed(self):
         if not self._qdrant_enabled():
@@ -2169,6 +2353,4 @@ class ChatExportPlugin(Star):
                 pass
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
-
-
 

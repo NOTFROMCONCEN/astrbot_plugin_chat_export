@@ -25,6 +25,7 @@
 ## 本次优化
 
 - 历史补录：支持通过 OneBot 历史 API 拉取群聊历史，并按消息时间写入 SQLite
+- 历史同步链路优化：自动缓存成功的 OneBot 历史接口策略，减少后续分页时的无效重试
 - SQLite 去重：`unique_key` 唯一索引，避免重复消息入库
 - SQLite 性能：WAL + NORMAL + busy_timeout
 - Qdrant 批量写：队列 + 批量 embedding + 批量 upsert
@@ -38,6 +39,7 @@
 - `history_sync_default_limit=100`: 历史同步默认补录条数
 - `history_sync_max_limit=1000`: 历史同步单次最大条数
 - `history_sync_page_size=20`: 历史同步分页大小
+- `history_sync_action_timeout_sec=8.0`: 单次历史 API 请求超时，避免协议端卡死时用户侧无响应
 - `stop_event_after_ingest=true`: 先采集再静默（只记录不回复）
 - `qdrant_enabled=true`
 - `search_default_since_hours=24`
