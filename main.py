@@ -2170,3 +2170,4 @@ class ChatExportPlugin(Star):
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
 
+
