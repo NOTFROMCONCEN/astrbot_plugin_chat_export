@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import mimetypes
 import re
 import sqlite3
 import time
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib import request
+from urllib.parse import urlparse
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -19,8 +21,8 @@ from astrbot.api.star import Context, Star, register
 @register(
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
-    "监听群消息并按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "1.3.7",
+    "监听群消息并支持历史补录，按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
+    "1.4.0",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -31,8 +33,12 @@ class ChatExportPlugin(Star):
         self.data_dir = self._resolve_data_dir(self.config.get("data_dir", ""))
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        self.db_file = self._resolve_path(self.config.get("db_path", "chat_export.db"), self.data_dir)
-        self.export_dir = self._resolve_path(self.config.get("export_dir", "exports"), self.data_dir)
+        self.db_file = self._resolve_path(
+            self.config.get("db_path", "chat_export.db"), self.data_dir
+        )
+        self.export_dir = self._resolve_path(
+            self.config.get("export_dir", "exports"), self.data_dir
+        )
         self.export_dir.mkdir(parents=True, exist_ok=True)
 
         self._startup_time = datetime.now()
@@ -53,6 +59,8 @@ class ChatExportPlugin(Star):
         self._last_sqlite_ok_ts = ""
         self._last_qdrant_ok_ts = ""
         self._last_error = ""
+        self._lsky_upload_ok = 0
+        self._lsky_upload_fail = 0
         self._sqlite_pending: list[dict[str, Any]] = []
         self._last_sqlite_flush_ts = time.time()
         self._qdrant_pending: list[dict[str, Any]] = []
@@ -72,7 +80,9 @@ class ChatExportPlugin(Star):
             self._log_verbose("skip message: empty group_id")
             return
         if not self._is_listening_group(group_id):
-            self._log_verbose(f"skip message: group {group_id} not in listening_group_ids")
+            self._log_verbose(
+                f"skip message: group {group_id} not in listening_group_ids"
+            )
             return
 
         user_id = self._norm(event.get_sender_id())
@@ -80,7 +90,10 @@ class ChatExportPlugin(Star):
         content = self._extract_text(event)
         message_time = self._event_time(event)
         message_id = self._extract_message_id(event)
-        unique_key = self._build_unique_key(group_id, user_id, message_time, content, message_id)
+        unique_key = self._build_unique_key(
+            group_id, user_id, message_time, content, message_id
+        )
+        media_json = self._build_media_json(event)
 
         record = {
             "ts": message_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -90,6 +103,7 @@ class ChatExportPlugin(Star):
             "content": content,
             "message_id": message_id,
             "unique_key": unique_key,
+            "media_json": media_json,
         }
 
         self._sqlite_pending.append(record)
@@ -153,6 +167,16 @@ class ChatExportPlugin(Star):
         async for result in self._handle_health(event):
             yield result
 
+    @filter.command("聊天历史同步")
+    async def sync_history_cn(self, event: AstrMessageEvent):
+        async for result in self._handle_history_sync(event):
+            yield result
+
+    @filter.command("chat_history_sync")
+    async def sync_history_en(self, event: AstrMessageEvent):
+        async for result in self._handle_history_sync(event):
+            yield result
+
     async def _handle_export(self, event: AstrMessageEvent):
         if not self._is_manager(event):
             yield event.plain_result("无权限执行导出")
@@ -180,7 +204,9 @@ class ChatExportPlugin(Star):
         start_dt = self._parse_dt(start_s)
         end_dt = self._parse_dt(end_s)
         if not start_dt or not end_dt:
-            yield event.plain_result("时间格式错误，支持: YYYY-MM-DDTHH:MM:SS / YYYY-MM-DD_HH:MM:SS / YYYY-MM-DD HH:MM:SS")
+            yield event.plain_result(
+                "时间格式错误，支持: YYYY-MM-DDTHH:MM:SS / YYYY-MM-DD_HH:MM:SS / YYYY-MM-DD HH:MM:SS"
+            )
             return
 
         if end_dt < start_dt:
@@ -197,8 +223,9 @@ class ChatExportPlugin(Star):
         out_file = self.export_dir / out_name
 
         with out_file.open("w", encoding="utf-8") as f:
-            for ts, gid, uid, uname, text in rows:
-                f.write(f"[{ts}] [群:{gid}] [{uname or uid}] {text}\n")
+            for ts, gid, uid, uname, text, media_json in rows:
+                line = self._format_export_line(text, media_json)
+                f.write(f"[{ts}] [群:{gid}] [{uname or uid}] {line}\n")
 
         yield event.plain_result(f"导出完成，共 {len(rows)} 条\n文件: {out_file}")
 
@@ -212,14 +239,18 @@ class ChatExportPlugin(Star):
             return
 
         if not self._qdrant_client or not self._qdrant_models:
-            yield event.plain_result("Qdrant 初始化失败，请检查 qdrant_url / qdrant_api_key / qdrant_client 依赖")
+            yield event.plain_result(
+                "Qdrant 初始化失败，请检查 qdrant_url / qdrant_api_key / qdrant_client 依赖"
+            )
             return
 
         self._flush_all_queues(force=True)
 
         tokens = [t for t in (event.message_str or "").strip().split() if t]
         if len(tokens) < 2:
-            yield event.plain_result("用法: /聊天检索 [群号] [最近1小时|recent:2h] <问题>")
+            yield event.plain_result(
+                "用法: /聊天检索 [群号] [最近1小时|recent:2h] <问题>"
+            )
             return
 
         group_id, query_text, since_dt = self._parse_search_args(tokens, event)
@@ -230,13 +261,17 @@ class ChatExportPlugin(Star):
 
         vector = self._embedding(query_text)
         if not vector:
-            yield event.plain_result("向量化失败，请检查 embedding_api_base / embedding_api_key / embedding_model")
+            yield event.plain_result(
+                "向量化失败，请检查 embedding_api_base / embedding_api_key / embedding_model"
+            )
             return
 
         limit = self._int_conf("search_top_k", 5)
         fetch_k = max(limit, self._int_conf("search_fetch_k", 60))
         candidates = self._search_qdrant(vector, group_id, fetch_k, since_dt)
-        points = self._post_filter_search_points(candidates, group_id, since_dt, query_text, limit)
+        points = self._post_filter_search_points(
+            candidates, group_id, since_dt, query_text, limit
+        )
         if not points:
             yield event.plain_result("未检索到相关聊天记录")
             return
@@ -247,7 +282,9 @@ class ChatExportPlugin(Star):
             payload = self._point_payload(p)
             ts = self._norm(payload.get("ts"))
             gid = self._norm(payload.get("group_id"))
-            uname = self._norm(payload.get("sender_name")) or self._norm(payload.get("user_id"))
+            uname = self._norm(payload.get("sender_name")) or self._norm(
+                payload.get("user_id")
+            )
             text = self._norm(payload.get("content"))
             lines.append(f"{idx}. [{ts}] [群:{gid}] [{uname}] {text}")
 
@@ -267,7 +304,11 @@ class ChatExportPlugin(Star):
             return
 
         action = self._norm(tokens[1]).lower()
-        group_id = self._norm(tokens[2]) if len(tokens) >= 3 else self._norm(event.get_group_id())
+        group_id = (
+            self._norm(tokens[2])
+            if len(tokens) >= 3
+            else self._norm(event.get_group_id())
+        )
         listening = set(self._listening_groups())
 
         if action in {"开始", "start", "on", "开启"}:
@@ -311,7 +352,11 @@ class ChatExportPlugin(Star):
         self._flush_all_queues(force=True)
 
         tokens = [t for t in (event.message_str or "").strip().split() if t]
-        group_id = self._norm(tokens[1]) if len(tokens) >= 2 else self._norm(event.get_group_id())
+        group_id = (
+            self._norm(tokens[1])
+            if len(tokens) >= 2
+            else self._norm(event.get_group_id())
+        )
 
         sqlite_total = self._count_sqlite()
         sqlite_group = self._count_sqlite(group_id) if group_id else sqlite_total
@@ -322,7 +367,9 @@ class ChatExportPlugin(Star):
         if self._qdrant_enabled() and self._qdrant_client:
             try:
                 qdrant_total = self._count_qdrant("")
-                qdrant_group = self._count_qdrant(group_id) if group_id else qdrant_total
+                qdrant_group = (
+                    self._count_qdrant(group_id) if group_id else qdrant_total
+                )
             except Exception as e:
                 qdrant_error = self._norm(e)
 
@@ -337,6 +384,7 @@ class ChatExportPlugin(Star):
             f"- runtime_received_group_events: {self._received_group_events}",
             f"- runtime_sqlite_ok/fail/dedup: {self._sqlite_write_ok}/{self._sqlite_write_fail}/{self._sqlite_dedup_skip}",
             f"- runtime_qdrant_ok/fail: {self._qdrant_write_ok}/{self._qdrant_write_fail}",
+            f"- runtime_lsky_ok/fail: {self._lsky_upload_ok}/{self._lsky_upload_fail}",
             f"- queue_sqlite: {len(self._sqlite_pending)}",
             f"- queue_qdrant: {len(self._qdrant_pending)}",
         ]
@@ -346,13 +394,19 @@ class ChatExportPlugin(Star):
         elif not self._qdrant_client:
             lines.append("- qdrant: 未初始化")
         else:
-            lines.append(f"- qdrant_total: {qdrant_total if qdrant_total is not None else 'unknown'}")
-            lines.append(f"- qdrant_group({group_id or 'all'}): {qdrant_group if qdrant_group is not None else 'unknown'}")
+            lines.append(
+                f"- qdrant_total: {qdrant_total if qdrant_total is not None else 'unknown'}"
+            )
+            lines.append(
+                f"- qdrant_group({group_id or 'all'}): {qdrant_group if qdrant_group is not None else 'unknown'}"
+            )
             if qdrant_error:
                 lines.append(f"- qdrant_error: {qdrant_error}")
 
         if self._received_group_events == 0 and self._listening_groups():
-            lines.append("- hint: 当前监听群非空但未收到事件，检查是否有其他插件提前 stop_event（如 force_silent 硬静默模式）")
+            lines.append(
+                "- hint: 当前监听群非空但未收到事件，检查是否有其他插件提前 stop_event（如 force_silent 硬静默模式）"
+            )
 
         yield event.plain_result("\n".join(lines))
 
@@ -376,10 +430,423 @@ class ChatExportPlugin(Star):
             f"- last_error: {self._last_error or 'none'}",
             f"- stop_event_after_ingest: {self._stop_event_after_ingest()}",
             f"- index_media_placeholders: {self._index_media_placeholders()}",
+            f"- lsky_enabled: {self._lsky_enabled()}",
             f"- sqlite_pending: {len(self._sqlite_pending)}",
             f"- qdrant_pending: {len(self._qdrant_pending)}",
         ]
         yield event.plain_result("\n".join(lines))
+
+    async def _handle_history_sync(self, event: AstrMessageEvent):
+        if not self._is_manager(event):
+            yield event.plain_result("无权限执行历史同步")
+            return
+
+        if self._norm(event.get_platform_name()).lower() != "aiocqhttp":
+            yield event.plain_result(
+                "当前仅支持 aiocqhttp 平台历史同步（NapCat / Lagrange / OneBot V11）"
+            )
+            return
+
+        tokens = [t for t in (event.message_str or "").strip().split() if t]
+        group_id, limit = self._parse_history_sync_args(tokens, event)
+        if not group_id:
+            yield event.plain_result(
+                "用法: /聊天历史同步 [条数] [群号]\n"
+                "示例1: /聊天历史同步 200\n"
+                "示例2: /聊天历史同步 200 123456"
+            )
+            return
+
+        self._flush_all_queues(force=True)
+
+        try:
+            stats = await self._sync_group_history(event, group_id, limit)
+        except Exception as e:
+            err = self._norm(e) or "unknown_error"
+            self._last_error = f"history_sync: {err}"
+            logger.warning(f"[chat_export] 历史同步失败: {err}")
+            yield event.plain_result(f"历史同步失败: {err}")
+            return
+
+        if stats["fetched"] <= 0:
+            yield event.plain_result(
+                "未获取到历史消息，请检查群号、协议端权限和历史 API 是否受支持"
+            )
+            return
+
+        lines = [
+            "历史同步完成",
+            f"群号: {group_id}",
+            f"分页请求: {stats['pages']} 次",
+            f"拉取消息: {stats['fetched']} 条",
+            f"有效记录: {stats['normalized']} 条",
+            f"新增入库: {stats['inserted']} 条",
+            f"重复跳过: {stats['duplicates']} 条",
+        ]
+        if stats["invalid"] > 0:
+            lines.append(f"解析跳过: {stats['invalid']} 条")
+        yield event.plain_result("\n".join(lines))
+
+    async def _sync_group_history(
+        self, event: AstrMessageEvent, group_id: str, limit: int
+    ) -> dict[str, int]:
+        bot = self._get_onebot_client(event)
+        if bot is None:
+            raise RuntimeError("未找到 aiocqhttp 客户端")
+
+        limit = self._clamp_history_limit(limit)
+        page_size = min(limit, max(1, self._int_conf("history_sync_page_size", 20)))
+        pages = 0
+        fetched = 0
+        invalid = 0
+        cursor: int | None = None
+        seen_keys: set[str] = set()
+        records: list[dict[str, Any]] = []
+
+        while len(records) < limit:
+            batch_size = min(page_size, limit - len(records))
+            response = await self._fetch_group_history_page(
+                bot, group_id, batch_size, cursor
+            )
+            items = self._extract_history_items(response)
+            if not items:
+                break
+
+            pages += 1
+            fetched += len(items)
+            oldest_seq: int | None = None
+
+            for item in items:
+                seq = self._extract_history_seq(item)
+                if seq is not None:
+                    oldest_seq = seq if oldest_seq is None else min(oldest_seq, seq)
+
+                record = self._normalize_history_message(group_id, item)
+                if record is None:
+                    invalid += 1
+                    continue
+                if record["unique_key"] in seen_keys:
+                    continue
+                seen_keys.add(record["unique_key"])
+                records.append(record)
+                if len(records) >= limit:
+                    break
+
+            next_cursor = self._next_history_cursor(oldest_seq, cursor)
+            if next_cursor is None:
+                break
+            cursor = next_cursor
+
+        records.sort(key=lambda rec: (rec["ts"], rec["message_id"], rec["user_id"]))
+        inserted = self._ingest_history_records(records)
+        return {
+            "pages": pages,
+            "fetched": fetched,
+            "normalized": len(records),
+            "inserted": len(inserted),
+            "duplicates": max(0, len(records) - len(inserted)),
+            "invalid": invalid,
+        }
+
+    def _ingest_history_records(
+        self, records: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not records:
+            return []
+
+        self._sqlite_pending.extend(records)
+        inserted = self._flush_sqlite_queue(force=True)
+        if inserted:
+            self._enqueue_qdrant_records(inserted)
+            self._flush_qdrant_queue(force=True)
+        return inserted
+
+    def _get_onebot_client(self, event: AstrMessageEvent) -> Any:
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            return bot
+        message_obj = getattr(event, "message_obj", None)
+        return getattr(message_obj, "bot", None)
+
+    async def _fetch_group_history_page(
+        self,
+        bot: Any,
+        group_id: str,
+        limit: int,
+        cursor: int | None,
+    ) -> Any:
+        errors: list[str] = []
+        for action, params in self._build_history_call_candidates(
+            group_id, limit, cursor
+        ):
+            try:
+                response = await self._call_onebot_action(bot, action, **params)
+            except Exception as e:
+                errors.append(f"{action}: {self._norm(e)}")
+                continue
+
+            if self._is_onebot_action_failed(response):
+                err = self._extract_onebot_action_error(response) or "action_failed"
+                errors.append(f"{action}: {err}")
+                continue
+
+            return response
+
+        err_text = (
+            "; ".join(err for err in errors[-4:] if err) or "协议端不支持群历史消息 API"
+        )
+        raise RuntimeError(err_text)
+
+    async def _call_onebot_action(self, bot: Any, action: str, **params) -> Any:
+        errors: list[str] = []
+
+        call_action = getattr(bot, "call_action", None)
+        if callable(call_action):
+            try:
+                return await call_action(action=action, **params)
+            except TypeError:
+                return await call_action(action, **params)
+            except Exception as e:
+                errors.append(self._norm(e))
+
+        api = getattr(bot, "api", None)
+        api_call_action = getattr(api, "call_action", None)
+        if callable(api_call_action):
+            try:
+                return await api_call_action(action, **params)
+            except Exception as e:
+                errors.append(self._norm(e))
+
+        err_text = (
+            " | ".join(err for err in errors if err) or "call_action_not_available"
+        )
+        raise RuntimeError(err_text)
+
+    def _build_history_call_candidates(
+        self,
+        group_id: str,
+        limit: int,
+        cursor: int | None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        group_value: Any = int(group_id) if group_id.isdigit() else group_id
+        if cursor is None:
+            param_candidates = [
+                {"group_id": group_value, "count": limit},
+                {"group_id": group_value, "limit": limit},
+                {"group_id": group_value},
+            ]
+        else:
+            param_candidates = [
+                {"group_id": group_value, "message_seq": cursor, "count": limit},
+                {"group_id": group_value, "message_seq": cursor, "limit": limit},
+                {"group_id": group_value, "message_seq": cursor},
+                {"group_id": group_value, "seq": cursor, "count": limit},
+                {"group_id": group_value, "seq": cursor, "limit": limit},
+                {"group_id": group_value, "seq": cursor},
+                {"group_id": group_value, "last_seq": cursor, "count": limit},
+                {"group_id": group_value, "last_seq": cursor},
+                {"group_id": group_value, "start_seq": cursor, "count": limit},
+                {"group_id": group_value, "start_seq": cursor},
+            ]
+
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for action in ("get_group_msg_history", "get_group_history_msg"):
+            for params in param_candidates:
+                key = (
+                    action,
+                    tuple(sorted((k, self._norm(v)) for k, v in params.items())),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append((action, params))
+        return candidates
+
+    def _extract_history_items(self, response: Any) -> list[dict[str, Any]]:
+        if isinstance(response, list):
+            return [item for item in response if isinstance(item, dict)]
+        if not isinstance(response, dict):
+            return []
+
+        for key in ("messages", "msg_list", "records", "list"):
+            value = response.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+
+        data = response.get("data")
+        if isinstance(data, (dict, list)):
+            items = self._extract_history_items(data)
+            if items or self._has_history_container(data):
+                return items
+
+        if self._looks_like_history_item(response):
+            return [response]
+        return []
+
+    @staticmethod
+    def _has_history_container(obj: Any) -> bool:
+        if isinstance(obj, list):
+            return True
+        if not isinstance(obj, dict):
+            return False
+        return any(
+            key in obj for key in ("messages", "msg_list", "records", "list", "data")
+        )
+
+    @staticmethod
+    def _looks_like_history_item(obj: Any) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        keys = {
+            "message_id",
+            "msg_id",
+            "message",
+            "raw_message",
+            "sender",
+            "time",
+            "user_id",
+        }
+        return any(key in obj for key in keys)
+
+    def _normalize_history_message(
+        self, default_group_id: str, item: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        group_id = self._norm(item.get("group_id")) or default_group_id
+        if not group_id:
+            return None
+
+        message_time = self._extract_history_time(item)
+        if message_time is None:
+            return None
+
+        user_id = self._extract_history_user_id(item)
+        sender_name = self._extract_history_sender_name(item)
+        content = self._extract_text_from_history_message(item)
+        message_id = self._extract_message_id_from_obj(item)
+        unique_key = self._build_unique_key(
+            group_id, user_id, message_time, content, message_id
+        )
+        media_json = self._build_media_json_from_obj(
+            item.get("message") if "message" in item else item
+        )
+
+        return {
+            "ts": message_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "group_id": group_id,
+            "user_id": user_id,
+            "sender_name": sender_name,
+            "content": content,
+            "message_id": message_id,
+            "unique_key": unique_key,
+            "media_json": media_json,
+        }
+
+    def _extract_history_time(self, item: dict[str, Any]) -> datetime | None:
+        for key in (
+            "time",
+            "timestamp",
+            "message_time",
+            "msg_time",
+            "send_time",
+            "date",
+        ):
+            dt = self._coerce_datetime(item.get(key))
+            if dt is not None:
+                return dt
+        return None
+
+    def _extract_history_user_id(self, item: dict[str, Any]) -> str:
+        sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
+        for value in (
+            item.get("user_id"),
+            item.get("sender_id"),
+            sender.get("user_id"),
+            sender.get("uin"),
+            sender.get("id"),
+        ):
+            text = self._norm(value)
+            if text:
+                return text
+        return ""
+
+    def _extract_history_sender_name(self, item: dict[str, Any]) -> str:
+        sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
+        for value in (
+            item.get("sender_name"),
+            item.get("nickname"),
+            sender.get("card"),
+            sender.get("nickname"),
+            sender.get("name"),
+        ):
+            text = self._norm(value)
+            if text:
+                return text
+        return ""
+
+    def _extract_text_from_history_message(self, item: dict[str, Any]) -> str:
+        raw_candidates = [
+            item.get("message_str"),
+            item.get("raw_message"),
+            item.get("text"),
+            item.get("content"),
+        ]
+        for value in raw_candidates:
+            text = self._norm(value)
+            if text and text not in {"[图片]", "[表情]", "[动画表情]"}:
+                return text
+
+        for key in ("message", "messages", "segments", "content"):
+            structured = self._format_message_obj(item.get(key))
+            if structured:
+                return structured
+
+        for value in raw_candidates:
+            text = self._norm(value)
+            if text:
+                return text
+        return "<空消息>"
+
+    def _extract_history_seq(self, item: dict[str, Any]) -> int | None:
+        for key in ("message_seq", "messageSeq", "seq", "msg_seq"):
+            value = item.get(key)
+            if value is None:
+                continue
+            text = self._norm(value)
+            if text.lstrip("-").isdigit():
+                return int(text)
+        return None
+
+    @staticmethod
+    def _next_history_cursor(
+        oldest_seq: int | None, prev_cursor: int | None
+    ) -> int | None:
+        if oldest_seq is None:
+            return None
+        next_cursor = oldest_seq - 1 if oldest_seq > 0 else oldest_seq
+        if prev_cursor is not None and next_cursor >= prev_cursor:
+            next_cursor = oldest_seq
+        if prev_cursor == next_cursor:
+            return None
+        return next_cursor
+
+    def _is_onebot_action_failed(self, response: Any) -> bool:
+        if not isinstance(response, dict):
+            return False
+        status = self._norm(response.get("status")).lower()
+        retcode = response.get("retcode")
+        if status == "failed":
+            return True
+        return retcode not in (None, 0, "0")
+
+    def _extract_onebot_action_error(self, response: Any) -> str:
+        if not isinstance(response, dict):
+            return ""
+        for key in ("wording", "msg", "message"):
+            text = self._norm(response.get(key))
+            if text:
+                return text
+        return ""
 
     def _init_db(self):
         conn = self._get_db_conn()
@@ -392,19 +859,29 @@ class ChatExportPlugin(Star):
               user_id TEXT,
               sender_name TEXT,
               content TEXT,
+              media_json TEXT,
               message_id TEXT,
               unique_key TEXT
             )
             """
         )
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()}
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
+        }
         if "message_id" not in cols:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN message_id TEXT")
+        if "media_json" not in cols:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN media_json TEXT")
         if "unique_key" not in cols:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN unique_key TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_ts ON chat_messages(ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_group_ts ON chat_messages(group_id, ts)")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_chat_unique_key ON chat_messages(unique_key)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_group_ts ON chat_messages(group_id, ts)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_chat_unique_key ON chat_messages(unique_key)"
+        )
         conn.commit()
 
     def _get_db_conn(self, reset: bool = False) -> sqlite3.Connection:
@@ -445,7 +922,10 @@ class ChatExportPlugin(Star):
         batch_size = max(1, self._int_conf("sqlite_batch_size", 20))
         interval = max(0.2, self._float_conf("sqlite_flush_interval_sec", 1.0))
         now = time.time()
-        if len(self._sqlite_pending) < batch_size and (now - self._last_sqlite_flush_ts) < interval:
+        if (
+            len(self._sqlite_pending) < batch_size
+            and (now - self._last_sqlite_flush_ts) < interval
+        ):
             return
         inserted = self._flush_sqlite_queue(force=False)
         if inserted:
@@ -456,13 +936,17 @@ class ChatExportPlugin(Star):
             return []
 
         batch_size = max(1, self._int_conf("sqlite_batch_size", 20))
-        take = len(self._sqlite_pending) if force else min(len(self._sqlite_pending), batch_size)
+        take = (
+            len(self._sqlite_pending)
+            if force
+            else min(len(self._sqlite_pending), batch_size)
+        )
         batch = self._sqlite_pending[:take]
         del self._sqlite_pending[:take]
 
         sql = (
-            "INSERT OR IGNORE INTO chat_messages(ts, group_id, user_id, sender_name, content, message_id, unique_key) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT OR IGNORE INTO chat_messages(ts, group_id, user_id, sender_name, content, media_json, message_id, unique_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         inserted: list[dict[str, Any]] = []
         duplicate_count = 0
@@ -481,6 +965,7 @@ class ChatExportPlugin(Star):
                             rec["user_id"],
                             rec["sender_name"],
                             rec["content"],
+                            rec.get("media_json", ""),
                             rec["message_id"],
                             rec["unique_key"],
                         ),
@@ -516,8 +1001,11 @@ class ChatExportPlugin(Star):
         return inserted
 
     def _query_messages(self, start_dt: datetime, end_dt: datetime, group_id: str):
-        sql = "SELECT ts, group_id, user_id, sender_name, content FROM chat_messages WHERE ts >= ? AND ts <= ?"
-        args: list[Any] = [start_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt.strftime("%Y-%m-%d %H:%M:%S")]
+        sql = "SELECT ts, group_id, user_id, sender_name, content, media_json FROM chat_messages WHERE ts >= ? AND ts <= ?"
+        args: list[Any] = [
+            start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
 
         if group_id:
             sql += " AND group_id = ?"
@@ -604,7 +1092,9 @@ class ChatExportPlugin(Star):
         try:
             self._qdrant_client.create_collection(
                 collection_name=collection,
-                vectors_config=self._qdrant_models.VectorParams(size=dim, distance=distance),
+                vectors_config=self._qdrant_models.VectorParams(
+                    size=dim, distance=distance
+                ),
             )
             return
         except Exception as e:
@@ -612,8 +1102,12 @@ class ChatExportPlugin(Star):
 
         self._create_collection_via_http(collection, dim, distance_name)
 
-    def _create_collection_via_http(self, collection: str, dim: int, distance_name: str):
-        base = self._norm(self.config.get("qdrant_url", "http://127.0.0.1:6333")).rstrip("/")
+    def _create_collection_via_http(
+        self, collection: str, dim: int, distance_name: str
+    ):
+        base = self._norm(
+            self.config.get("qdrant_url", "http://127.0.0.1:6333")
+        ).rstrip("/")
         api_key = self._norm(self.config.get("qdrant_api_key", ""))
         url = f"{base}/collections/{collection}"
 
@@ -637,7 +1131,9 @@ class ChatExportPlugin(Star):
             if api_key:
                 req.add_header("api-key", api_key)
             try:
-                with request.urlopen(req, timeout=self._int_conf("qdrant_timeout", 10)) as _:
+                with request.urlopen(
+                    req, timeout=self._int_conf("qdrant_timeout", 10)
+                ) as _:
                     return
             except Exception as e:
                 last_err = e
@@ -647,24 +1143,39 @@ class ChatExportPlugin(Star):
     def _flush_qdrant_queue_if_needed(self):
         if not self._qdrant_pending:
             return
-        if not self._qdrant_enabled() or not self._qdrant_client or not self._qdrant_models:
+        if (
+            not self._qdrant_enabled()
+            or not self._qdrant_client
+            or not self._qdrant_models
+        ):
             return
 
         batch_size = max(1, self._int_conf("qdrant_batch_size", 20))
         interval = max(0.2, self._float_conf("qdrant_flush_interval_sec", 1.0))
         now = time.time()
-        if len(self._qdrant_pending) < batch_size and (now - self._last_qdrant_flush_ts) < interval:
+        if (
+            len(self._qdrant_pending) < batch_size
+            and (now - self._last_qdrant_flush_ts) < interval
+        ):
             return
         self._flush_qdrant_queue(force=False)
 
     def _flush_qdrant_queue(self, force: bool):
         if not self._qdrant_pending:
             return
-        if not self._qdrant_enabled() or not self._qdrant_client or not self._qdrant_models:
+        if (
+            not self._qdrant_enabled()
+            or not self._qdrant_client
+            or not self._qdrant_models
+        ):
             return
 
         batch_size = max(1, self._int_conf("qdrant_batch_size", 20))
-        take = len(self._qdrant_pending) if force else min(len(self._qdrant_pending), batch_size)
+        take = (
+            len(self._qdrant_pending)
+            if force
+            else min(len(self._qdrant_pending), batch_size)
+        )
         batch = self._qdrant_pending[:take]
         del self._qdrant_pending[:take]
 
@@ -691,14 +1202,20 @@ class ChatExportPlugin(Star):
                 "message_id": rec["message_id"],
                 "unique_key": rec["unique_key"],
             }
-            points.append(self._qdrant_models.PointStruct(id=point_id, vector=vec, payload=payload))
+            points.append(
+                self._qdrant_models.PointStruct(
+                    id=point_id, vector=vec, payload=payload
+                )
+            )
 
         if not points:
             self._last_qdrant_flush_ts = time.time()
             return
 
         try:
-            self._qdrant_client.upsert(collection_name=collection, points=points, wait=False)
+            self._qdrant_client.upsert(
+                collection_name=collection, points=points, wait=False
+            )
             self._qdrant_write_ok += len(points)
             self._last_qdrant_ok_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         except Exception as e:
@@ -710,7 +1227,13 @@ class ChatExportPlugin(Star):
         finally:
             self._last_qdrant_flush_ts = time.time()
 
-    def _search_qdrant(self, query_vector: list[float], group_id: str, limit: int, since_dt: datetime | None):
+    def _search_qdrant(
+        self,
+        query_vector: list[float],
+        group_id: str,
+        limit: int,
+        since_dt: datetime | None,
+    ):
         if not self._qdrant_client or not self._qdrant_models:
             return []
 
@@ -763,7 +1286,9 @@ class ChatExportPlugin(Star):
                     with_vectors=False,
                 )
 
-            logger.error("[chat_export] qdrant search 失败: 当前 qdrant-client 不支持 search/query_points")
+            logger.error(
+                "[chat_export] qdrant search 失败: 当前 qdrant-client 不支持 search/query_points"
+            )
             return []
         except Exception as e:
             logger.error(f"[chat_export] qdrant search 失败: {e}")
@@ -798,7 +1323,9 @@ class ChatExportPlugin(Star):
             pass
 
         # HTTP 回退：POST /collections/{collection}/points/count
-        base = self._norm(self.config.get("qdrant_url", "http://127.0.0.1:6333")).rstrip("/")
+        base = self._norm(
+            self.config.get("qdrant_url", "http://127.0.0.1:6333")
+        ).rstrip("/")
         api_key = self._norm(self.config.get("qdrant_api_key", ""))
         url = f"{base}/collections/{collection}/points/count"
         body_obj: dict[str, Any] = {"exact": True}
@@ -821,7 +1348,9 @@ class ChatExportPlugin(Star):
         if not texts:
             return []
 
-        api_base = self._norm(self.config.get("embedding_api_base", "https://api.openai.com/v1"))
+        api_base = self._norm(
+            self.config.get("embedding_api_base", "https://api.openai.com/v1")
+        )
         api_key = self._norm(self.config.get("embedding_api_key", ""))
         model = self._norm(self.config.get("embedding_model", "text-embedding-3-small"))
 
@@ -836,10 +1365,12 @@ class ChatExportPlugin(Star):
         req.add_header("Authorization", f"Bearer {api_key}")
 
         try:
-            with request.urlopen(req, timeout=self._int_conf("embedding_timeout", 20)) as resp:
+            with request.urlopen(
+                req, timeout=self._int_conf("embedding_timeout", 20)
+            ) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             vecs: list[list[float]] = [[] for _ in texts]
-            for item in (data.get("data", []) if isinstance(data, dict) else []):
+            for item in data.get("data", []) if isinstance(data, dict) else []:
                 idx = int(item.get("index", 0))
                 emb = item.get("embedding", [])
                 if 0 <= idx < len(vecs) and isinstance(emb, list):
@@ -879,6 +1410,228 @@ class ChatExportPlugin(Star):
     def _embedding(self, text: str) -> list[float]:
         arr = self._embedding_batch([text])
         return arr[0] if arr else []
+
+    def _build_media_json(self, event: AstrMessageEvent) -> str:
+        refs = self._extract_image_refs(event)
+        return self._build_media_json_from_refs(refs)
+
+    def _build_media_json_from_obj(self, obj: Any) -> str:
+        refs = self._extract_image_refs_from_obj(obj)
+        return self._build_media_json_from_refs(refs)
+
+    def _build_media_json_from_refs(self, refs: list[dict[str, str]]) -> str:
+        if not refs:
+            return ""
+
+        items: list[dict[str, Any]] = []
+        for ref in refs:
+            item: dict[str, Any] = {
+                "type": "image",
+                "source_url": self._norm(ref.get("url")),
+                "source_file": self._norm(ref.get("file")),
+            }
+            if self._lsky_enabled():
+                ok, lsky_url, lsky_key, err = self._upload_ref_to_lsky(ref)
+                if ok:
+                    item["lsky_url"] = lsky_url
+                    item["lsky_key"] = lsky_key
+                    item["status"] = "uploaded"
+                    self._lsky_upload_ok += 1
+                else:
+                    item["status"] = "failed"
+                    item["error"] = err
+                    self._lsky_upload_fail += 1
+            else:
+                item["status"] = "skipped"
+            items.append(item)
+
+        try:
+            return json.dumps(items, ensure_ascii=False)
+        except Exception:
+            return ""
+
+    def _format_export_line(self, text: str, media_json: str) -> str:
+        line = text or ""
+        if not media_json:
+            return line
+        try:
+            items = json.loads(media_json)
+        except Exception:
+            return line
+        if not isinstance(items, list):
+            return line
+        lsky_urls = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            url = self._norm(it.get("lsky_url"))
+            if url:
+                lsky_urls.append(url)
+        if not lsky_urls:
+            return line
+        return f"{line} {' '.join(f'[图床:{u}]' for u in lsky_urls)}".strip()
+
+    def _extract_image_refs(self, event: AstrMessageEvent) -> list[dict[str, str]]:
+        refs: list[dict[str, str]] = []
+        seen: set[str] = set()
+        candidates = [
+            getattr(event, "message_obj", None),
+            getattr(event, "message", None),
+            getattr(event, "messages", None),
+        ]
+        for obj in candidates:
+            self._collect_image_refs(obj, refs, seen)
+        return refs
+
+    def _extract_image_refs_from_obj(self, obj: Any) -> list[dict[str, str]]:
+        refs: list[dict[str, str]] = []
+        seen: set[str] = set()
+        self._collect_image_refs(obj, refs, seen)
+        return refs
+
+    def _collect_image_refs(self, obj: Any, refs: list[dict[str, str]], seen: set[str]):
+        if obj is None:
+            return
+        if isinstance(obj, list):
+            for seg in obj:
+                self._collect_image_refs(seg, refs, seen)
+            return
+        if isinstance(obj, dict):
+            seg_type = self._norm(obj.get("type")).lower()
+            data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+            if seg_type == "image":
+                url = self._norm(data.get("url"))
+                file = self._norm(data.get("file"))
+                key = f"{url}|{file}"
+                if key and key not in seen:
+                    seen.add(key)
+                    refs.append({"url": url, "file": file})
+            for k in ("message", "messages", "segments"):
+                if isinstance(obj.get(k), list):
+                    self._collect_image_refs(obj.get(k), refs, seen)
+            return
+
+        seg_type = self._norm(getattr(obj, "type", "")).lower()
+        if seg_type == "image":
+            data = getattr(obj, "data", None)
+            if isinstance(data, dict):
+                url = self._norm(data.get("url"))
+                file = self._norm(data.get("file"))
+                key = f"{url}|{file}"
+                if key and key not in seen:
+                    seen.add(key)
+                    refs.append({"url": url, "file": file})
+
+    def _lsky_enabled(self) -> bool:
+        return bool(self.config.get("lsky_enabled", False))
+
+    def _upload_ref_to_lsky(self, ref: dict[str, str]) -> tuple[bool, str, str, str]:
+        source_url = self._norm(ref.get("url"))
+        source_file = self._norm(ref.get("file"))
+
+        data = b""
+        filename = ""
+        if source_url.startswith("http://") or source_url.startswith("https://"):
+            data, filename, err = self._download_bytes(source_url)
+            if err:
+                self._last_error = f"lsky_download: {err}"
+                return False, "", "", err
+        elif source_file and (
+            source_file.startswith("http://") or source_file.startswith("https://")
+        ):
+            data, filename, err = self._download_bytes(source_file)
+            if err:
+                self._last_error = f"lsky_download: {err}"
+                return False, "", "", err
+        else:
+            return False, "", "", "no_http_image_source"
+
+        ok, lsky_url, lsky_key, err = self._lsky_upload_bytes(data, filename)
+        if not ok:
+            self._last_error = f"lsky_upload: {err}"
+            return False, "", "", err
+        return True, lsky_url, lsky_key, ""
+
+    def _download_bytes(self, url: str) -> tuple[bytes, str, str]:
+        try:
+            req = request.Request(url=url, method="GET")
+            with request.urlopen(
+                req, timeout=self._int_conf("lsky_timeout", 20)
+            ) as resp:
+                body = resp.read()
+            parsed = urlparse(url)
+            filename = Path(parsed.path).name or f"img_{int(time.time() * 1000)}.jpg"
+            return body, filename, ""
+        except Exception as e:
+            return b"", "", self._norm(e)
+
+    def _lsky_upload_bytes(
+        self, data: bytes, filename: str
+    ) -> tuple[bool, str, str, str]:
+        api_base = self._norm(self.config.get("lsky_api_base", "")).rstrip("/")
+        token = self._norm(self.config.get("lsky_token", ""))
+        album_id = self._norm(self.config.get("lsky_album_id", ""))
+        if not api_base or not token:
+            return False, "", "", "missing_lsky_api_or_token"
+
+        endpoint = f"{api_base}/api/v1/upload"
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        boundary = f"----AstrBotBoundary{int(time.time()*1000)}"
+        body = self._build_multipart_body(
+            boundary, filename, content_type, data, album_id
+        )
+
+        req = request.Request(url=endpoint, data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        req.add_header("Accept", "application/json")
+        try:
+            with request.urlopen(
+                req, timeout=self._int_conf("lsky_timeout", 20)
+            ) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            obj = json.loads(raw) if raw else {}
+            payload = obj.get("data", {}) if isinstance(obj, dict) else {}
+            links = payload.get("links", {}) if isinstance(payload, dict) else {}
+            lsky_url = self._norm(links.get("url")) or self._norm(payload.get("url"))
+            lsky_key = self._norm(payload.get("key"))
+            if not lsky_url:
+                return False, "", "", "lsky_response_no_url"
+            return True, lsky_url, lsky_key, ""
+        except Exception as e:
+            return False, "", "", self._norm(e)
+
+    def _build_multipart_body(
+        self,
+        boundary: str,
+        filename: str,
+        content_type: str,
+        file_bytes: bytes,
+        album_id: str,
+    ) -> bytes:
+        sep = f"--{boundary}\r\n".encode("utf-8")
+        end = f"--{boundary}--\r\n".encode("utf-8")
+        chunks: list[bytes] = []
+        if album_id:
+            chunks.append(sep)
+            chunks.append(b'Content-Disposition: form-data; name="album_id"\r\n\r\n')
+            chunks.append(album_id.encode("utf-8"))
+            chunks.append(b"\r\n")
+
+        safe_name = filename.replace('"', "_")
+        chunks.append(sep)
+        chunks.append(
+            (
+                'Content-Disposition: form-data; name="file"; filename="'
+                + safe_name
+                + '"\r\n'
+            ).encode("utf-8")
+        )
+        chunks.append((f"Content-Type: {content_type}\r\n\r\n").encode("utf-8"))
+        chunks.append(file_bytes)
+        chunks.append(b"\r\n")
+        chunks.append(end)
+        return b"".join(chunks)
 
     def _extract_text(self, event: AstrMessageEvent) -> str:
         # 1) 优先普通文本
@@ -1013,22 +1766,42 @@ class ChatExportPlugin(Star):
                 if s:
                     return s
         obj = getattr(event, "message_obj", None)
-        if isinstance(obj, dict):
+        s = self._extract_message_id_from_obj(obj)
+        if s:
+            return s
+        return ""
+
+    def _extract_message_id_from_obj(self, obj: Any) -> str:
+        if not isinstance(obj, dict):
+            return ""
+        for key in ("message_id", "msg_id", "id"):
+            s = self._norm(obj.get(key))
+            if s:
+                return s
+        data = obj.get("data")
+        if isinstance(data, dict):
             for key in ("message_id", "msg_id", "id"):
-                s = self._norm(obj.get(key))
+                s = self._norm(data.get(key))
                 if s:
                     return s
         return ""
 
     def _build_unique_key(
-        self, group_id: str, user_id: str, message_time: datetime, content: str, message_id: str
+        self,
+        group_id: str,
+        user_id: str,
+        message_time: datetime,
+        content: str,
+        message_id: str,
     ) -> str:
         if message_id:
             return f"gid:{group_id}|mid:{message_id}"
         digest = hashlib.sha1(content.encode("utf-8", errors="ignore")).hexdigest()
         return f"gid:{group_id}|uid:{user_id}|ts:{message_time.strftime('%Y-%m-%d %H:%M:%S')}|sha1:{digest}"
 
-    def _parse_search_args(self, tokens: list[str], event: AstrMessageEvent) -> tuple[str, str, datetime | None]:
+    def _parse_search_args(
+        self, tokens: list[str], event: AstrMessageEvent
+    ) -> tuple[str, str, datetime | None]:
         args = tokens[1:]
         group_id = self._norm(event.get_group_id())
         if args and args[0].isdigit():
@@ -1089,7 +1862,9 @@ class ChatExportPlugin(Star):
 
         strict_group = bool(self.config.get("search_hard_group_filter", True))
         strict_time = bool(self.config.get("search_hard_time_filter", True))
-        keyword_mode = self._norm(self.config.get("search_keyword_mode", "auto")).lower()
+        keyword_mode = self._norm(
+            self.config.get("search_keyword_mode", "auto")
+        ).lower()
         query = (query_text or "").strip().lower()
 
         filtered: list[Any] = []
@@ -1098,7 +1873,11 @@ class ChatExportPlugin(Star):
             if not payload:
                 continue
 
-            if strict_group and group_id and self._norm(payload.get("group_id")) != group_id:
+            if (
+                strict_group
+                and group_id
+                and self._norm(payload.get("group_id")) != group_id
+            ):
                 continue
 
             if strict_time and since_dt:
@@ -1125,7 +1904,12 @@ class ChatExportPlugin(Star):
 
             # auto 模式：query 很短时，只保留包含关键词的结果，避免偏题
             if keyword_mode == "auto" and query and len(query) <= 8:
-                hard_hits = [p for p in filtered if query in self._norm(self._point_payload(p).get("content")).lower()]
+                hard_hits = [
+                    p
+                    for p in filtered
+                    if query
+                    in self._norm(self._point_payload(p).get("content")).lower()
+                ]
                 if hard_hits:
                     filtered = hard_hits
 
@@ -1216,6 +2000,18 @@ class ChatExportPlugin(Star):
     @staticmethod
     def _parse_dt(s: str) -> datetime | None:
         text = s.strip()
+        if not text:
+            return None
+
+        iso_text = text.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(iso_text)
+            if dt.tzinfo is not None:
+                return dt.astimezone().replace(tzinfo=None)
+            return dt
+        except ValueError:
+            pass
+
         formats = [
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%d_%H:%M:%S",
@@ -1228,7 +2024,9 @@ class ChatExportPlugin(Star):
                 continue
         return None
 
-    def _parse_export_args(self, tokens: list[str], event: AstrMessageEvent) -> tuple[str, str, str]:
+    def _parse_export_args(
+        self, tokens: list[str], event: AstrMessageEvent
+    ) -> tuple[str, str, str]:
         args = tokens[1:]
         default_group = self._norm(event.get_group_id())
 
@@ -1245,6 +2043,60 @@ class ChatExportPlugin(Star):
             return start_s, end_s, group_id
 
         return "", "", default_group
+
+    def _parse_history_sync_args(
+        self, tokens: list[str], event: AstrMessageEvent
+    ) -> tuple[str, int]:
+        args = tokens[1:]
+        group_id = self._norm(event.get_group_id())
+        limit = self._history_default_limit()
+
+        if not args:
+            return group_id, limit
+
+        if len(args) == 1:
+            arg = self._norm(args[0])
+            if group_id and arg.isdigit():
+                return group_id, self._clamp_history_limit(int(arg))
+            return arg, limit
+
+        first = self._norm(args[0])
+        second = self._norm(args[1])
+        if first.isdigit():
+            return second or group_id, self._clamp_history_limit(int(first))
+        if second.isdigit():
+            return first or group_id, self._clamp_history_limit(int(second))
+        return first or group_id, limit
+
+    def _history_default_limit(self) -> int:
+        return max(1, self._int_conf("history_sync_default_limit", 100))
+
+    def _history_max_limit(self) -> int:
+        return max(1, self._int_conf("history_sync_max_limit", 1000))
+
+    def _clamp_history_limit(self, value: int) -> int:
+        return max(1, min(value, self._history_max_limit()))
+
+    def _coerce_datetime(self, value: Any) -> datetime | None:
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e12:
+                ts /= 1000.0
+            try:
+                return datetime.fromtimestamp(ts)
+            except Exception:
+                return None
+
+        text = self._norm(value)
+        if not text:
+            return None
+        if text.isdigit():
+            return self._coerce_datetime(int(text))
+        try:
+            return self._coerce_datetime(float(text))
+        except ValueError:
+            pass
+        return self._parse_dt(text)
 
     def _int_conf(self, key: str, default: int) -> int:
         try:
@@ -1278,6 +2130,7 @@ class ChatExportPlugin(Star):
             f"data_dir={self.data_dir} "
             f"db_file={self.db_file} "
             f"listening={sorted(self._listening_groups())} "
+            f"lsky_enabled={self._lsky_enabled()} "
             f"qdrant_batch={self._int_conf('qdrant_batch_size', 20)} "
             f"qdrant_interval={self._float_conf('qdrant_flush_interval_sec', 1.0)}"
         )
@@ -1316,10 +2169,4 @@ class ChatExportPlugin(Star):
                 pass
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
-
-
-
-
-
-
 
