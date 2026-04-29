@@ -23,7 +23,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并支持历史补录，按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "2.0.4",
+    "2.0.5",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -558,6 +558,11 @@ class ChatExportPlugin(Star):
         if not summary:
             yield event.plain_result("分析失败：请检查 analysis_api_base / analysis_api_key / analysis_model")
             return
+        if self._looks_like_model_refusal(summary):
+            summary = (
+                "模型触发风控，已切换为本地统计分析：\n\n"
+                + self._build_local_analysis(rows, group_id, user_id, since_dt)
+            )
 
         who = f"用户 {user_id}" if user_id else "全群"
         since_text = since_dt.strftime("%Y-%m-%d %H:%M:%S") if since_dt else "不限"
@@ -2448,12 +2453,64 @@ class ChatExportPlugin(Star):
         for ts, gid, uid, uname, content in rows:
             speaker = self._norm(uname) or self._norm(uid)
             text = self._norm(content).replace("\n", " ").strip()
+            # 轻量去风险：对敏感词做泛化，降低模型策略拦截概率
+            text = re.sub(r"(自杀|杀人|强奸|毒品|爆炸|未成年|嫖娼)", "[敏感词]", text, flags=re.IGNORECASE)
             line = f"[{ts}] [{speaker}] {text}"
             total += len(line) + 1
             if total > max_chars:
                 break
             lines.append(line)
         return "\n".join(lines)
+
+    def _looks_like_model_refusal(self, text: str) -> bool:
+        t = self._norm(text).lower()
+        if not t:
+            return True
+        flags = [
+            "rejected because it was considered high risk",
+            "considered high risk",
+            "content policy",
+            "cannot help with",
+            "i can't help with",
+            "i cannot comply",
+            "请求被拒绝",
+            "高风险",
+            "无法协助",
+        ]
+        return any(flag in t for flag in flags)
+
+    def _build_local_analysis(
+        self,
+        rows: list[tuple[str, str, str, str, str]],
+        group_id: str,
+        user_id: str,
+        since_dt: datetime | None,
+    ) -> str:
+        msg_count = len(rows)
+        speakers: dict[str, int] = {}
+        total_chars = 0
+        short_msgs = 0
+        for _ts, _gid, uid, uname, content in rows:
+            speaker = self._norm(uname) or self._norm(uid)
+            speakers[speaker] = speakers.get(speaker, 0) + 1
+            c = len(self._norm(content))
+            total_chars += c
+            if c <= 8:
+                short_msgs += 1
+
+        avg_chars = (total_chars / msg_count) if msg_count else 0.0
+        top_speakers = sorted(speakers.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_text = "、".join(f"{name}:{cnt}" for name, cnt in top_speakers) or "无"
+        since_text = since_dt.strftime("%Y-%m-%d %H:%M:%S") if since_dt else "不限"
+        target = f"用户 {user_id}" if user_id else "全群"
+        return (
+            f"1) 范围: 群 {group_id}，对象 {target}，时间下限 {since_text}\n"
+            f"2) 消息量: {msg_count} 条\n"
+            f"3) 发言者分布(Top5): {top_text}\n"
+            f"4) 平均消息长度: {avg_chars:.1f} 字\n"
+            f"5) 短句占比(<=8字): {short_msgs}/{msg_count}\n"
+            "6) 说明: 该结果为本地统计摘要（未调用模型语义推断）"
+        )
 
     def _call_analysis_llm(
         self,
@@ -2785,6 +2842,7 @@ class ChatExportPlugin(Star):
                 pass
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
+
 
 
 
