@@ -47,6 +47,26 @@
     "type": "float",
     "default": 8.0
   },
+  "history_sync_rounds": {
+    "description": "历史同步最大轮次（每轮从游标继续拉取）",
+    "type": "int",
+    "default": 3
+  },
+  "history_sync_max_pages": {
+    "description": "每轮历史同步最大分页请求次数",
+    "type": "int",
+    "default": 50
+  },
+  "history_sync_stop_no_new_rounds": {
+    "description": "连续 N 轮无新增候选后停止",
+    "type": "int",
+    "default": 2
+  },
+  "history_sync_resume_from_saved_cursor": {
+    "description": "是否从数据库保存的历史游标继续同步",
+    "type": "bool",
+    "default": true
+  },
   "admin_user_ids": {
     "description": "允许执行导出/检索命令的用户 ID 列表",
     "type": "list",

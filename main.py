@@ -23,7 +23,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并支持历史补录，按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "2.0.1",
+    "2.0.2",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -501,6 +501,7 @@ class ChatExportPlugin(Star):
         lines = [
             "历史同步完成",
             f"群号: {group_id}",
+            f"轮次: {stats.get('rounds', 1)}",
             f"分页请求: {stats['pages']} 次",
             f"拉取消息: {stats['fetched']} 条",
             f"有效记录: {stats['normalized']} 条",
@@ -509,6 +510,9 @@ class ChatExportPlugin(Star):
         ]
         if stats["invalid"] > 0:
             lines.append(f"解析跳过: {stats['invalid']} 条")
+        stop_reason = self._norm(stats.get("stop_reason"))
+        if stop_reason:
+            lines.append(f"终止原因: {stop_reason}")
         yield event.plain_result("\n".join(lines))
 
     async def _sync_group_history(
@@ -519,28 +523,107 @@ class ChatExportPlugin(Star):
             raise RuntimeError("未找到 aiocqhttp 客户端")
 
         limit = self._clamp_history_limit(limit)
+        max_rounds = max(1, self._int_conf("history_sync_rounds", 3))
+        no_new_stop_rounds = max(1, self._int_conf("history_sync_stop_no_new_rounds", 2))
+        use_saved_cursor = bool(self.config.get("history_sync_resume_from_saved_cursor", True))
+        overall_seen_keys: set[str] = set()
+        total_pages = 0
+        total_fetched = 0
+        total_invalid = 0
+        total_records: list[dict[str, Any]] = []
+        rounds = 0
+        consecutive_no_new = 0
+        stop_reason = ""
+
+        saved_cursor = self._load_history_cursor(group_id) if use_saved_cursor else None
+        cursor = saved_cursor
+        anchor_message_id = self._resolve_history_anchor_message_id(event, group_id)
+
+        while rounds < max_rounds and len(total_records) < limit:
+            rounds += 1
+            pass_stats = await self._sync_group_history_pass(
+                bot=bot,
+                group_id=group_id,
+                limit=(limit - len(total_records)),
+                cursor=cursor,
+                anchor_message_id=anchor_message_id,
+                seen_keys=overall_seen_keys,
+            )
+            total_pages += pass_stats["pages"]
+            total_fetched += pass_stats["fetched"]
+            total_invalid += pass_stats["invalid"]
+            total_records.extend(pass_stats["records"])
+            cursor = pass_stats.get("cursor")
+
+            if cursor:
+                self._save_history_cursor(group_id, cursor)
+
+            if pass_stats["insertable"] <= 0:
+                consecutive_no_new += 1
+            else:
+                consecutive_no_new = 0
+
+            if pass_stats["stop_reason"] == "no_items":
+                stop_reason = "接口返回空页"
+                break
+            if pass_stats["stop_reason"] == "cursor_stable":
+                stop_reason = "游标不再推进"
+                break
+            if len(total_records) >= limit:
+                stop_reason = "达到目标条数"
+                break
+            if consecutive_no_new >= no_new_stop_rounds:
+                stop_reason = f"连续{consecutive_no_new}轮无新增候选"
+                break
+
+        if not stop_reason:
+            stop_reason = "达到最大轮次"
+
+        total_records.sort(key=lambda rec: (rec["ts"], rec["message_id"], rec["user_id"]))
+        inserted = self._ingest_history_records(total_records)
+        return {
+            "rounds": rounds,
+            "pages": total_pages,
+            "fetched": total_fetched,
+            "normalized": len(total_records),
+            "inserted": len(inserted),
+            "duplicates": max(0, len(total_records) - len(inserted)),
+            "invalid": total_invalid,
+            "stop_reason": stop_reason,
+        }
+
+    async def _sync_group_history_pass(
+        self,
+        bot: Any,
+        group_id: str,
+        limit: int,
+        cursor: dict[str, Any] | None,
+        anchor_message_id: str,
+        seen_keys: set[str],
+    ) -> dict[str, Any]:
         page_size = min(limit, max(1, self._int_conf("history_sync_page_size", 20)))
+        max_pages = max(1, self._int_conf("history_sync_max_pages", 50))
         pages = 0
         fetched = 0
         invalid = 0
-        cursor: dict[str, Any] | None = None
-        seen_keys: set[str] = set()
         records: list[dict[str, Any]] = []
-        anchor_message_id = self._resolve_history_anchor_message_id(event, group_id)
+        stop_reason = ""
+        local_cursor = cursor
 
-        while len(records) < limit:
+        while len(records) < limit and pages < max_pages:
             batch_size = min(page_size, limit - len(records))
             response, action_name = await self._fetch_group_history_page(
-                bot, group_id, batch_size, cursor, anchor_message_id
+                bot, group_id, batch_size, local_cursor, anchor_message_id
             )
             items = self._extract_history_items(response)
             if not items:
+                stop_reason = "no_items"
                 break
 
             pages += 1
             fetched += len(items)
             self._log_verbose(
-                f"history_sync page={pages} action={action_name} items={len(items)} cursor={cursor or {}}"
+                f"history_sync page={pages} action={action_name} items={len(items)} cursor={local_cursor or {}}"
             )
 
             for item in items:
@@ -555,20 +638,26 @@ class ChatExportPlugin(Star):
                 if len(records) >= limit:
                     break
 
-            next_cursor = self._next_history_cursor(items, cursor)
+            next_cursor = self._next_history_cursor(items, local_cursor)
             if next_cursor is None:
+                stop_reason = "cursor_none"
                 break
-            cursor = next_cursor
+            if local_cursor is not None and next_cursor == local_cursor:
+                stop_reason = "cursor_stable"
+                break
+            local_cursor = next_cursor
 
-        records.sort(key=lambda rec: (rec["ts"], rec["message_id"], rec["user_id"]))
-        inserted = self._ingest_history_records(records)
+        if not stop_reason and pages >= max_pages:
+            stop_reason = "max_pages"
+
         return {
             "pages": pages,
             "fetched": fetched,
-            "normalized": len(records),
-            "inserted": len(inserted),
-            "duplicates": max(0, len(records) - len(inserted)),
             "invalid": invalid,
+            "records": records,
+            "insertable": len(records),
+            "cursor": local_cursor,
+            "stop_reason": stop_reason,
         }
 
     def _ingest_history_records(
@@ -1011,6 +1100,47 @@ class ChatExportPlugin(Star):
                 return message_id
         return self._latest_group_message_id(group_id)
 
+    def _load_history_cursor(self, group_id: str) -> dict[str, Any] | None:
+        sql = "SELECT cursor_json FROM history_sync_state WHERE group_id = ?"
+        for retry in range(2):
+            try:
+                conn = self._get_db_conn(reset=(retry == 1))
+                row = conn.execute(sql, (group_id,)).fetchone()
+                if not row or not row[0]:
+                    return None
+                obj = json.loads(row[0])
+                return obj if isinstance(obj, dict) else None
+            except Exception as e:
+                self._last_error = f"history_cursor_load: {e}"
+                if retry == 0:
+                    continue
+                logger.warning(f"[chat_export] 历史游标读取失败: {e}")
+                return None
+        return None
+
+    def _save_history_cursor(self, group_id: str, cursor: dict[str, Any]):
+        try:
+            payload = json.dumps(cursor, ensure_ascii=False)
+        except Exception:
+            return
+        sql = (
+            "INSERT INTO history_sync_state(group_id, cursor_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(group_id) DO UPDATE SET cursor_json=excluded.cursor_json, updated_at=excluded.updated_at"
+        )
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for retry in range(2):
+            try:
+                conn = self._get_db_conn(reset=(retry == 1))
+                conn.execute(sql, (group_id, payload, now_text))
+                conn.commit()
+                return
+            except Exception as e:
+                self._last_error = f"history_cursor_save: {e}"
+                if retry == 0:
+                    continue
+                logger.warning(f"[chat_export] 历史游标保存失败: {e}")
+                return
+
     def _is_onebot_action_failed(self, response: Any) -> bool:
         if not isinstance(response, dict):
             return False
@@ -1062,6 +1192,15 @@ class ChatExportPlugin(Star):
         )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_chat_unique_key ON chat_messages(unique_key)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS history_sync_state (
+              group_id TEXT PRIMARY KEY,
+              cursor_json TEXT,
+              updated_at TEXT
+            )
+            """
         )
         conn.commit()
 
@@ -2448,4 +2587,6 @@ class ChatExportPlugin(Star):
                 pass
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
+
+
 
