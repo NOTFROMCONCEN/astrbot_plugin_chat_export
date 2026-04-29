@@ -23,7 +23,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并支持历史补录，按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "2.0.2",
+    "2.0.4",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -196,6 +196,16 @@ class ChatExportPlugin(Star):
     @filter.command("chat_history_sync")
     async def sync_history_en(self, event: AstrMessageEvent):
         async for result in self._handle_history_sync(event):
+            yield result
+
+    @filter.command("聊天分析")
+    async def analyze_chat_cn(self, event: AstrMessageEvent):
+        async for result in self._handle_chat_analyze(event):
+            yield result
+
+    @filter.command("chat_analyze")
+    async def analyze_chat_en(self, event: AstrMessageEvent):
+        async for result in self._handle_chat_analyze(event):
             yield result
 
     async def _handle_export(self, event: AstrMessageEvent):
@@ -514,6 +524,46 @@ class ChatExportPlugin(Star):
         if stop_reason:
             lines.append(f"终止原因: {stop_reason}")
         yield event.plain_result("\n".join(lines))
+
+    async def _handle_chat_analyze(self, event: AstrMessageEvent):
+        if not self._is_manager(event):
+            yield event.plain_result("无权限执行聊天分析")
+            return
+
+        self._flush_all_queues(force=True)
+        tokens = [t for t in (event.message_str or "").strip().split() if t]
+        group_id, user_id, since_dt = self._parse_analyze_args(tokens, event)
+        if not group_id:
+            yield event.plain_result(
+                "用法: /聊天分析 <群号> [用户ID] [最近24小时|recent:2d]\n"
+                "示例1: /聊天分析 1058402699 最近24小时\n"
+                "示例2: /聊天分析 1058402699 1097681347 recent:7d"
+            )
+            return
+
+        limit = max(20, self._int_conf("analysis_max_messages", 400))
+        rows = self._query_messages_for_analysis(group_id, user_id, since_dt, limit)
+        if not rows:
+            yield event.plain_result("未找到可分析的聊天记录")
+            return
+
+        transcript = self._build_analysis_transcript(rows)
+        summary = self._call_analysis_llm(
+            transcript=transcript,
+            group_id=group_id,
+            user_id=user_id,
+            since_dt=since_dt,
+            sample_size=len(rows),
+        )
+        if not summary:
+            yield event.plain_result("分析失败：请检查 analysis_api_base / analysis_api_key / analysis_model")
+            return
+
+        who = f"用户 {user_id}" if user_id else "全群"
+        since_text = since_dt.strftime("%Y-%m-%d %H:%M:%S") if since_dt else "不限"
+        yield event.plain_result(
+            f"[聊天分析]\n群号: {group_id}\n对象: {who}\n时间下限: {since_text}\n样本数: {len(rows)}\n\n{summary}"
+        )
 
     async def _sync_group_history(
         self, event: AstrMessageEvent, group_id: str, limit: int
@@ -1385,6 +1435,41 @@ class ChatExportPlugin(Star):
                 return []
         return []
 
+    def _query_messages_for_analysis(
+        self,
+        group_id: str,
+        user_id: str,
+        since_dt: datetime | None,
+        limit: int,
+    ) -> list[tuple[str, str, str, str, str]]:
+        sql = (
+            "SELECT ts, group_id, user_id, sender_name, content "
+            "FROM chat_messages WHERE group_id = ?"
+        )
+        args: list[Any] = [group_id]
+        if user_id:
+            sql += " AND user_id = ?"
+            args.append(user_id)
+        if since_dt is not None:
+            sql += " AND ts >= ?"
+            args.append(since_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        sql += " ORDER BY ts DESC LIMIT ?"
+        args.append(max(1, limit))
+
+        for retry in range(2):
+            try:
+                conn = self._get_db_conn(reset=(retry == 1))
+                rows = conn.execute(sql, tuple(args)).fetchall()
+                rows.reverse()
+                return rows
+            except Exception as e:
+                self._last_error = f"sqlite_query_analysis: {e}"
+                if retry == 0:
+                    continue
+                logger.error(f"[chat_export] sqlite analysis query 失败: {e}")
+                return []
+        return []
+
     def _count_sqlite(self, group_id: str = "") -> int:
         sql = "SELECT COUNT(1) FROM chat_messages"
         args: list[Any] = []
@@ -2235,6 +2320,34 @@ class ChatExportPlugin(Star):
 
         return group_id, " ".join(filtered).strip(), since_dt
 
+    def _parse_analyze_args(
+        self, tokens: list[str], event: AstrMessageEvent
+    ) -> tuple[str, str, datetime | None]:
+        args = tokens[1:]
+        default_group = self._norm(event.get_group_id())
+        group_id = default_group
+        user_id = ""
+        since_dt = None
+
+        if args and args[0].isdigit():
+            group_id = self._norm(args[0])
+            args = args[1:]
+        if args and args[0].isdigit():
+            user_id = self._norm(args[0])
+            args = args[1:]
+
+        for token in args:
+            parsed = self._parse_recent_time_token(token)
+            if parsed is not None and since_dt is None:
+                since_dt = parsed
+
+        if since_dt is None:
+            default_hours = self._int_conf("analysis_default_since_hours", 72)
+            if default_hours > 0:
+                since_dt = datetime.now() - timedelta(hours=default_hours)
+
+        return group_id, user_id, since_dt
+
     def _parse_recent_time_token(self, token: str) -> datetime | None:
         t = token.strip().lower()
         m = re.match(r"^最近(\d+)(小时|时|h|天|d)$", t)
@@ -2325,6 +2438,91 @@ class ChatExportPlugin(Star):
                     filtered = hard_hits
 
         return filtered[: max(1, limit)]
+
+    def _build_analysis_transcript(
+        self, rows: list[tuple[str, str, str, str, str]]
+    ) -> str:
+        max_chars = max(2000, self._int_conf("analysis_max_chars", 18000))
+        lines: list[str] = []
+        total = 0
+        for ts, gid, uid, uname, content in rows:
+            speaker = self._norm(uname) or self._norm(uid)
+            text = self._norm(content).replace("\n", " ").strip()
+            line = f"[{ts}] [{speaker}] {text}"
+            total += len(line) + 1
+            if total > max_chars:
+                break
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _call_analysis_llm(
+        self,
+        transcript: str,
+        group_id: str,
+        user_id: str,
+        since_dt: datetime | None,
+        sample_size: int,
+    ) -> str:
+        if not transcript:
+            return ""
+        api_base = self._norm(self.config.get("analysis_api_base", "")) or self._norm(
+            self.config.get("embedding_api_base", "https://api.openai.com/v1")
+        )
+        api_key = self._norm(self.config.get("analysis_api_key", "")) or self._norm(
+            self.config.get("embedding_api_key", "")
+        )
+        model = self._norm(self.config.get("analysis_model", "gpt-4o-mini"))
+        timeout = max(10, self._int_conf("analysis_timeout_sec", 60))
+        temperature = max(0.0, min(1.5, self._float_conf("analysis_temperature", 0.4)))
+        max_tokens = max(256, self._int_conf("analysis_max_output_tokens", 900))
+        if not api_key:
+            return ""
+
+        target_text = f"用户 {user_id}" if user_id else "全群"
+        since_text = since_dt.strftime("%Y-%m-%d %H:%M:%S") if since_dt else "不限"
+        system_prompt = (
+            "你是聊天行为分析助手。请基于提供的真实聊天记录做客观分析。"
+            "输出结构：1) 主要话题 2) 语言风格 3) 情绪倾向 4) 关系互动特征 "
+            "5) 可用于人格学习的稳定特征 6) 风险与偏差提醒。"
+            "不要编造未出现的信息。"
+        )
+        user_prompt = (
+            f"分析对象: {target_text}\n"
+            f"群号: {group_id}\n"
+            f"时间下限: {since_text}\n"
+            f"样本条数: {sample_size}\n\n"
+            f"聊天记录:\n{transcript}"
+        )
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        url = api_base.rstrip("/") + "/chat/completions"
+        req = request.Request(
+            url=url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        try:
+            with request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            obj = json.loads(raw) if raw else {}
+            choices = obj.get("choices", []) if isinstance(obj, dict) else []
+            if not choices:
+                return ""
+            msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+            return self._norm(msg.get("content"))
+        except Exception as e:
+            self._last_error = f"analysis_llm: {e}"
+            logger.warning(f"[chat_export] 聊天分析调用失败: {e}")
+            return ""
 
     def _index_media_placeholders(self) -> bool:
         return bool(self.config.get("index_media_placeholders", False))
@@ -2587,6 +2785,7 @@ class ChatExportPlugin(Star):
                 pass
             self._sqlite_conn = None
         logger.info("[chat_export] terminated")
+
 
 
 
