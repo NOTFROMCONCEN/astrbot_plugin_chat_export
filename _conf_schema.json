@@ -63,17 +63,17 @@
   "verbose_log": {
     "description": "是否输出详细采集日志（排查入库问题建议开启）",
     "type": "bool",
-    "default": true
+    "default": false
   },
   "log_every_n": {
     "description": "每写入 N 条 SQLite 记录输出一次 ingest 日志",
     "type": "int",
-    "default": 1
+    "default": 500
   },
   "log_preview_len": {
     "description": "ingest 日志里的消息预览长度",
     "type": "int",
-    "default": 24
+    "default": 0
   },
   "search_default_since_hours": {
     "description": "聊天检索默认回溯小时数（0 表示不限）",
@@ -219,5 +219,25 @@
     "description": "SQLite 队列刷新间隔（秒）",
     "type": "float",
     "default": 1.0
+  },
+  "max_pending_size": {
+    "description": "SQLite/Qdrant 队列最大长度，超出时丢弃最旧数据",
+    "type": "int",
+    "default": 5000
+  },
+  "error_cooldown_sec": {
+    "description": "错误冷却期（秒），在此期间连续错误达到阈值后会丢弃数据",
+    "type": "float",
+    "default": 60.0
+  },
+  "max_consecutive_errors": {
+    "description": "连续错误次数阈值，超过后进入冷却丢弃模式",
+    "type": "int",
+    "default": 5
+  },
+  "max_log_line_length": {
+    "description": "单条日志最大长度，超出时截断",
+    "type": "int",
+    "default": 512
   }
 }

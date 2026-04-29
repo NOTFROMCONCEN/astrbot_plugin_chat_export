@@ -23,7 +23,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并支持历史补录，按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "1.4.0",
+    "2.0.1",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -67,6 +67,17 @@ class ChatExportPlugin(Star):
         self._qdrant_pending: list[dict[str, Any]] = []
         self._last_qdrant_flush_ts = time.time()
         self._history_action_hints: dict[str, tuple[str, tuple[str, ...]]] = {}
+
+        # 错误冷却与限流保护（防止异常时日志/重试风暴）
+        self._sqlite_error_count = 0
+        self._sqlite_last_error_ts = 0.0
+        self._qdrant_error_count = 0
+        self._qdrant_last_error_ts = 0.0
+        self._max_pending_size = self._int_conf("max_pending_size", 5000)
+        self._error_cooldown_sec = self._float_conf("error_cooldown_sec", 60.0)
+        self._max_consecutive_errors = self._int_conf("max_consecutive_errors", 5)
+        self._max_log_line_length = self._int_conf("max_log_line_length", 512)
+
         self._init_qdrant_if_needed()
         self._log_startup_summary()
 
@@ -87,15 +98,19 @@ class ChatExportPlugin(Star):
             )
             return
 
-        user_id = self._norm(event.get_sender_id())
-        sender_name = self._norm(getattr(event, "get_sender_name", lambda: "")())
-        content = self._extract_text(event)
-        message_time = self._event_time(event)
-        message_id = self._extract_message_id(event)
-        unique_key = self._build_unique_key(
-            group_id, user_id, message_time, content, message_id
-        )
-        media_json = self._build_media_json(event)
+        try:
+            user_id = self._norm(event.get_sender_id())
+            sender_name = self._norm(getattr(event, "get_sender_name", lambda: "")())
+            content = self._extract_text(event)
+            message_time = self._event_time(event)
+            message_id = self._extract_message_id(event)
+            unique_key = self._build_unique_key(
+                group_id, user_id, message_time, content, message_id
+            )
+            media_json = self._build_media_json(event)
+        except Exception as e:
+            self._log_verbose(f"message parse error: {e}")
+            return
 
         record = {
             "ts": message_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -108,13 +123,17 @@ class ChatExportPlugin(Star):
             "media_json": media_json,
         }
 
+        if len(self._sqlite_pending) >= self._max_pending_size:
+            dropped = self._sqlite_pending[: self._max_pending_size // 10]
+            del self._sqlite_pending[: len(dropped)]
+            self._sqlite_write_fail += len(dropped)
+            self._log_verbose(f"pending overflow: dropped {len(dropped)} sqlite records")
         self._sqlite_pending.append(record)
+
         self._flush_sqlite_queue_if_needed()
         self._flush_qdrant_queue_if_needed()
-
         self._log_ingest_progress(group_id, user_id, content)
 
-        # 可选：采集完成后终止传播，实现“只记录不回复”
         if self._stop_event_after_ingest():
             event.stop_event()
             self._log_verbose(f"stop_event_after_ingest: group={group_id}")
@@ -1074,6 +1093,27 @@ class ChatExportPlugin(Star):
     def _enqueue_qdrant_records(self, records: list[dict[str, Any]]):
         if not records or not self._qdrant_enabled():
             return
+
+        # 冷却期检查：Qdrant 连续失败时直接丢弃，避免队列无限膨胀
+        if self._qdrant_error_count >= self._max_consecutive_errors:
+            now = time.time()
+            if now - self._qdrant_last_error_ts < self._error_cooldown_sec:
+                dropped = len([
+                    r for r in records
+                    if self._should_index_to_qdrant(self._norm(r.get("content")))
+                ])
+                self._qdrant_write_fail += dropped
+                self._log_verbose(f"qdrant enqueue skipped: in cooldown, dropped {dropped} records")
+                return
+
+        # 队列溢出保护：超出上限时丢弃最旧 10%
+        if len(self._qdrant_pending) >= self._max_pending_size:
+            drop_count = min(len(self._qdrant_pending) // 10 or 1, len(self._qdrant_pending))
+            dropped = self._qdrant_pending[:drop_count]
+            del self._qdrant_pending[:drop_count]
+            self._qdrant_write_fail += drop_count
+            self._log_verbose(f"qdrant pending overflow: dropped {drop_count} records")
+
         for rec in records:
             if self._should_index_to_qdrant(self._norm(rec.get("content"))):
                 self._qdrant_pending.append(rec)
@@ -1096,6 +1136,19 @@ class ChatExportPlugin(Star):
     def _flush_sqlite_queue(self, force: bool) -> list[dict[str, Any]]:
         if not self._sqlite_pending:
             return []
+
+        # 错误冷却：连续错误超限后丢弃数据，防止无限重试风暴
+        if self._sqlite_error_count >= self._max_consecutive_errors:
+            now = time.time()
+            if now - self._sqlite_last_error_ts < self._error_cooldown_sec:
+                dropped = self._sqlite_pending[: len(self._sqlite_pending) // 2 or 1]
+                self._sqlite_write_fail += len(dropped)
+                del self._sqlite_pending[: len(dropped)]
+                self._last_sqlite_flush_ts = now
+                self._log_verbose(f"sqlite cooldown: dropped {len(dropped)} records")
+                return []
+            # 冷却结束，重置计数
+            self._sqlite_error_count = 0
 
         batch_size = max(1, self._int_conf("sqlite_batch_size", 20))
         take = (
@@ -1150,11 +1203,17 @@ class ChatExportPlugin(Star):
                 if retry == 0:
                     continue
                 self._sqlite_write_fail += len(batch)
-                logger.error(f"[chat_export] sqlite 批量写入失败: {e}")
+                self._sqlite_error_count += 1
+                self._sqlite_last_error_ts = time.time()
+                # 使用截断日志，避免超长异常信息
+                err_text = self._norm(e)[: self._max_log_line_length]
+                logger.error(f"[chat_export] sqlite 批量写入失败: {err_text}")
                 self._sqlite_pending = batch + self._sqlite_pending
                 self._last_sqlite_flush_ts = time.time()
                 return []
 
+        # 成功则重置错误计数
+        self._sqlite_error_count = 0
         self._sqlite_write_ok += len(inserted)
         self._sqlite_dedup_skip += duplicate_count
         if inserted:
@@ -1344,15 +1403,27 @@ class ChatExportPlugin(Star):
             return
         self._flush_qdrant_queue(force=False)
 
-    def _flush_qdrant_queue(self, force: bool):
+    def _flush_qdrant_queue(self, force: bool) -> list[dict[str, Any]]:
         if not self._qdrant_pending:
-            return
+            return []
         if (
             not self._qdrant_enabled()
             or not self._qdrant_client
             or not self._qdrant_models
         ):
-            return
+            return []
+
+        # 错误冷却保护：冷却期内直接丢弃数据，不调用 Embedding API
+        if self._qdrant_error_count >= self._max_consecutive_errors:
+            now = time.time()
+            if now - self._qdrant_last_error_ts < self._error_cooldown_sec:
+                dropped = self._qdrant_pending[: len(self._qdrant_pending) // 2 or 1]
+                self._qdrant_write_fail += len(dropped)
+                del self._qdrant_pending[: len(dropped)]
+                self._last_qdrant_flush_ts = now
+                self._log_verbose(f"qdrant cooldown: dropped {len(dropped)} records")
+                return []
+            self._qdrant_error_count = 0
 
         batch_size = max(1, self._int_conf("qdrant_batch_size", 20))
         take = (
@@ -1367,14 +1438,20 @@ class ChatExportPlugin(Star):
         vectors = self._embedding_batch(texts)
         if len(vectors) != len(batch):
             self._qdrant_write_fail += len(batch)
+            self._qdrant_error_count += 1
+            self._qdrant_last_error_ts = time.time()
             self._last_error = "embedding_batch_size_mismatch"
-            return
+            # 回退到队列头部，避免丢数据
+            self._qdrant_pending = batch + self._qdrant_pending
+            return []
 
         collection = self._norm(self.config.get("qdrant_collection", "chat_export"))
-        points = []
+        points: list[Any] = []
+        retry_records: list[dict[str, Any]] = []
         for rec, vec in zip(batch, vectors):
             if not vec:
-                self._qdrant_write_fail += 1
+                # 空向量也回退到队列尾部重试，避免永久丢失
+                retry_records.append(rec)
                 continue
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, rec["unique_key"]))
             payload = {
@@ -1392,24 +1469,35 @@ class ChatExportPlugin(Star):
                 )
             )
 
+        # 空向量记录回退
+        if retry_records:
+            self._qdrant_pending.extend(retry_records)
+            self._log_verbose(f"qdrant empty vectors: retry {len(retry_records)} records")
+
         if not points:
             self._last_qdrant_flush_ts = time.time()
-            return
+            return []
 
         try:
             self._qdrant_client.upsert(
                 collection_name=collection, points=points, wait=False
             )
             self._qdrant_write_ok += len(points)
+            self._qdrant_error_count = 0
             self._last_qdrant_ok_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         except Exception as e:
             self._qdrant_write_fail += len(points)
+            self._qdrant_error_count += 1
+            self._qdrant_last_error_ts = time.time()
             self._last_error = f"qdrant_upsert: {e}"
-            logger.warning(f"[chat_export] qdrant upsert 失败: {e}")
-            # 失败回队列头，避免丢数据
-            self._qdrant_pending = batch + self._qdrant_pending
+            err_text = self._norm(e)[: self._max_log_line_length]
+            logger.warning(f"[chat_export] qdrant upsert 失败: {err_text}")
+            # upsert 失败时，将对应原始记录回退到队列头部
+            failed_records = [rec for rec, vec in zip(batch, vectors) if vec]
+            self._qdrant_pending = failed_records[:len(points)] + self._qdrant_pending
         finally:
             self._last_qdrant_flush_ts = time.time()
+        return points
 
     def _search_qdrant(
         self,
@@ -2300,11 +2388,15 @@ class ChatExportPlugin(Star):
             save_fn()
 
     def _verbose_log_enabled(self) -> bool:
-        return bool(self.config.get("verbose_log", True))
+        return bool(self.config.get("verbose_log", False))
 
     def _log_verbose(self, text: str):
-        if self._verbose_log_enabled():
-            logger.info(f"[chat_export] {text}")
+        if not self._verbose_log_enabled():
+            return
+        msg = f"[chat_export] {text}"
+        if len(msg) > self._max_log_line_length:
+            msg = msg[: self._max_log_line_length] + "...[truncated]"
+        logger.info(msg)
 
     def _log_startup_summary(self):
         self._log_verbose(
@@ -2320,14 +2412,14 @@ class ChatExportPlugin(Star):
         )
 
     def _log_ingest_progress(self, group_id: str, user_id: str, content: str):
-        every_n = self._int_conf("log_every_n", 1)
+        every_n = self._int_conf("log_every_n", 500)
         if every_n <= 0:
-            every_n = 1
+            every_n = 500
         if self._received_group_events % every_n != 0:
             return
-        preview_len = self._int_conf("log_preview_len", 24)
+        preview_len = self._int_conf("log_preview_len", 0)
         preview = (content or "").replace("\n", " ").strip()
-        if len(preview) > preview_len:
+        if preview_len > 0 and len(preview) > preview_len:
             preview = preview[:preview_len] + "..."
         self._log_verbose(
             "ingest: "
@@ -2345,7 +2437,10 @@ class ChatExportPlugin(Star):
         return str(v).strip()
 
     async def terminate(self):
-        self._flush_all_queues(force=True)
+        try:
+            self._flush_all_queues(force=True)
+        except Exception as e:
+            logger.warning(f"[chat_export] terminate flush error: {e}")
         if self._sqlite_conn is not None:
             try:
                 self._sqlite_conn.close()
