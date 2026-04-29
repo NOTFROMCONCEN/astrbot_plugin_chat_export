@@ -225,6 +225,51 @@
     "type": "string",
     "default": "auto"
   },
+  "analysis_api_base": {
+    "description": "聊天分析模型接口 Base URL（OpenAI 兼容）",
+    "type": "string",
+    "default": ""
+  },
+  "analysis_api_key": {
+    "description": "聊天分析模型接口 Key（为空则回退 embedding_api_key）",
+    "type": "string",
+    "default": ""
+  },
+  "analysis_model": {
+    "description": "聊天分析模型名",
+    "type": "string",
+    "default": "gpt-4o-mini"
+  },
+  "analysis_default_since_hours": {
+    "description": "聊天分析默认回溯小时数",
+    "type": "int",
+    "default": 72
+  },
+  "analysis_max_messages": {
+    "description": "聊天分析最多读取的消息条数",
+    "type": "int",
+    "default": 400
+  },
+  "analysis_max_chars": {
+    "description": "传给分析模型的最大字符数",
+    "type": "int",
+    "default": 18000
+  },
+  "analysis_timeout_sec": {
+    "description": "聊天分析请求超时（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "analysis_temperature": {
+    "description": "聊天分析模型温度",
+    "type": "float",
+    "default": 0.4
+  },
+  "analysis_max_output_tokens": {
+    "description": "聊天分析最大输出 tokens",
+    "type": "int",
+    "default": 900
+  },
   "sqlite_wal": {
     "description": "是否启用 SQLite WAL 模式",
     "type": "bool",
