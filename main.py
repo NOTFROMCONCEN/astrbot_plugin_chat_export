@@ -18,12 +18,17 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+_ANALYSIS_SENSITIVE_RE = re.compile(
+    r"(自杀|殺人|杀人|強姦|强奸|毒品|爆炸|未成年|嫖娼)",
+    re.IGNORECASE,
+)
+
 
 @register(
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并支持历史补录，按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "2.0.5",
+    "2.0.6",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -143,6 +148,11 @@ class ChatExportPlugin(Star):
         async for result in self._handle_export(event):
             yield result
 
+    @filter.command("聊天匯出")
+    async def export_chat_tw(self, event: AstrMessageEvent):
+        async for result in self._handle_export(event):
+            yield result
+
     @filter.command("chat_export")
     async def export_chat_en(self, event: AstrMessageEvent):
         async for result in self._handle_export(event):
@@ -150,6 +160,11 @@ class ChatExportPlugin(Star):
 
     @filter.command("聊天检索")
     async def semantic_search_cn(self, event: AstrMessageEvent):
+        async for result in self._handle_semantic_search(event):
+            yield result
+
+    @filter.command("聊天檢索")
+    async def semantic_search_tw(self, event: AstrMessageEvent):
         async for result in self._handle_semantic_search(event):
             yield result
 
@@ -163,6 +178,11 @@ class ChatExportPlugin(Star):
         async for result in self._handle_listen_manage(event):
             yield result
 
+    @filter.command("聊天監聽")
+    async def manage_listen_tw(self, event: AstrMessageEvent):
+        async for result in self._handle_listen_manage(event):
+            yield result
+
     @filter.command("chat_listen")
     async def manage_listen_en(self, event: AstrMessageEvent):
         async for result in self._handle_listen_manage(event):
@@ -170,6 +190,11 @@ class ChatExportPlugin(Star):
 
     @filter.command("聊天统计")
     async def stats_cn(self, event: AstrMessageEvent):
+        async for result in self._handle_stats(event):
+            yield result
+
+    @filter.command("聊天統計")
+    async def stats_tw(self, event: AstrMessageEvent):
         async for result in self._handle_stats(event):
             yield result
 
@@ -190,6 +215,11 @@ class ChatExportPlugin(Star):
 
     @filter.command("聊天历史同步")
     async def sync_history_cn(self, event: AstrMessageEvent):
+        async for result in self._handle_history_sync(event):
+            yield result
+
+    @filter.command("聊天歷史同步")
+    async def sync_history_tw(self, event: AstrMessageEvent):
         async for result in self._handle_history_sync(event):
             yield result
 
@@ -342,7 +372,7 @@ class ChatExportPlugin(Star):
         )
         listening = set(self._listening_groups())
 
-        if action in {"开始", "start", "on", "开启"}:
+        if action in {"开始", "開始", "start", "on", "开启", "開啟"}:
             if not group_id:
                 yield event.plain_result("请提供群号：/聊天监听 开始 <群号>")
                 return
@@ -353,7 +383,7 @@ class ChatExportPlugin(Star):
             yield event.plain_result(f"已开始监听群: {group_id}")
             return
 
-        if action in {"停止", "stop", "off", "关闭"}:
+        if action in {"停止", "stop", "off", "关闭", "關閉"}:
             if not group_id:
                 yield event.plain_result("请提供群号：/聊天监听 停止 <群号>")
                 return
@@ -364,7 +394,7 @@ class ChatExportPlugin(Star):
             yield event.plain_result(f"已停止监听群: {group_id}")
             return
 
-        if action in {"状态", "status"}:
+        if action in {"状态", "狀態", "status"}:
             if group_id:
                 state = "监听中" if group_id in listening else "未监听"
                 yield event.plain_result(f"群 {group_id} 当前状态: {state}")
@@ -2454,7 +2484,7 @@ class ChatExportPlugin(Star):
             speaker = self._norm(uname) or self._norm(uid)
             text = self._norm(content).replace("\n", " ").strip()
             # 轻量去风险：对敏感词做泛化，降低模型策略拦截概率
-            text = re.sub(r"(自杀|杀人|强奸|毒品|爆炸|未成年|嫖娼)", "[敏感词]", text, flags=re.IGNORECASE)
+            text = _ANALYSIS_SENSITIVE_RE.sub("[敏感词]", text)
             line = f"[{ts}] [{speaker}] {text}"
             total += len(line) + 1
             if total > max_chars:
