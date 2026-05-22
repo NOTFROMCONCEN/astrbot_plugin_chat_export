@@ -60,7 +60,7 @@ from utils import build_unique_key, looks_like_model_refusal, norm, parse_dt
     "astrbot_plugin_chat_export",
     "NOTFROMCONCEN",
     "监听群消息并支持历史补录，按时间范围导出聊天记录为 TXT，支持 Qdrant 语义检索",
-    "2.2.0",
+    "2.2.2",
 )
 class ChatExportPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -835,4 +835,5 @@ class ChatExportPlugin(Star):
                 pass
             self._async_http = None
         logger.info("[chat_export] terminated")
+
 
