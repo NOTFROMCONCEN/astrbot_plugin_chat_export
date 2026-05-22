@@ -245,6 +245,11 @@ class QdrantClientWrapper:
         collection = norm(self._config.get("qdrant_collection", "chat_export"))
         q_filter = self._build_filter(group_id, since_dt)
         top_k = max(1, min(limit, 100))
+        # 时间过滤场景下适当过采样，减少 ANN 召回被旧消息“挤占”导致的漏检。
+        if since_dt and bool(self._config.get("search_hard_time_filter", True)):
+            overfetch = max(1, int_conf(self._config, "search_overfetch_multiplier", 4))
+            max_top_k = max(top_k, int_conf(self._config, "search_overfetch_max_top_k", 300))
+            top_k = min(max_top_k, max(top_k, limit * overfetch))
 
         try:
             if hasattr(self._client, "query_points"):

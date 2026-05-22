@@ -210,6 +210,16 @@
     "type": "int",
     "default": 60
   },
+  "search_overfetch_multiplier": {
+    "description": "启用时间硬过滤时的候选过采样倍数（降低跨时段误召回）",
+    "type": "int",
+    "default": 4
+  },
+  "search_overfetch_max_top_k": {
+    "description": "时间硬过滤场景下候选最大拉取上限",
+    "type": "int",
+    "default": 300
+  },
   "search_hard_group_filter": {
     "description": "检索结果是否强制只保留指定群号",
     "type": "bool",

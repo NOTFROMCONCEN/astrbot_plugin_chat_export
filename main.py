@@ -835,3 +835,4 @@ class ChatExportPlugin(Star):
                 pass
             self._async_http = None
         logger.info("[chat_export] terminated")
+
